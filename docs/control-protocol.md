@@ -8,6 +8,27 @@ lines: one request object per line, one reply per line.
 {"id": 1, "ok": true, "result": {"id": 258}}
 ```
 
+## Authentication
+
+The first line on every connection must authenticate:
+
+```json
+{"id": 0, "method": "auth", "params": {"token": "…"}}
+{"id": 0, "ok": true, "result": {"authenticated": true}}
+```
+
+The token is `DECKCRAFT_CONTROL_TOKEN` when it is set where the app starts, else a random one the
+app writes on startup to `deckcraft-control-<port>.token` in `$XDG_RUNTIME_DIR` (when set) or the
+per-user temporary folder (`$TMPDIR` on macOS), readable by the user only. The app logs the
+file's path. `deckcraft-cli` (`mcp --connect` and the other commands that reach a running app)
+reads the token from `DECKCRAFT_CONTROL_TOKEN` or that file by itself.
+
+Any other first line, including one that isn't JSON (such as an HTTP request a web page sends to
+the port), gets an error reply and the connection is closed. Loopback alone doesn't keep other
+local programs, or a page in the user's browser, out of the control channel.
+
+## Requests
+
 Coordinates are slide points (1/72 inch; a 16:9 slide is 960 × 540) unless noted.
 
 | Method | Params | What it does |
