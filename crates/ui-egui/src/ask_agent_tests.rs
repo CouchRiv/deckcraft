@@ -647,3 +647,48 @@ fn escape_for_a_dialog_and_ime_typing_never_cancel_a_request() {
     assert!(h.state().ask_agent.bubble.is_none());
     assert_eq!(hub.request(request).unwrap().state, State::Waiting);
 }
+
+#[test]
+fn idle_presence_has_an_expiry_repaint_and_owned_work_survives_record_eviction() {
+    let hub = AgentHub::new(7979, None);
+    assert!(hub.presence_refresh_after().is_none());
+    hub.listen(1, ms(0), || true);
+    let delay = hub.presence_refresh_after().unwrap();
+    assert!(delay > Duration::ZERO && delay <= ms(PRESENCE_MS as u64));
+    let id = hub.ask("work", sel(""), json!({})).unwrap();
+    hub.listen(1, ms(0), || true).unwrap();
+    assert!(hub.presence_refresh_after().is_none(), "owned work waits for connection events, not a grace timer");
+    for conn in 2..MAX_AGENTS as u64 + 4 {
+        hub.listen(conn, ms(0), || true);
+    }
+    assert!(!hub.lock().agents.iter().any(|(conn, _)| *conn == 1), "the bounded recent-connection record was evicted");
+    for (_, seen) in &mut hub.lock().agents {
+        *seen -= PRESENCE_MS + 1_000.0;
+    }
+    assert!(hub.agent_present(), "the still-open owner remains present even after its recent record was evicted");
+    hub.disconnect(1);
+    assert_eq!(hub.request(id).unwrap().state, State::Waiting);
+    assert!(!hub.agent_present());
+    assert!(hub.presence_refresh_after().is_none());
+}
+
+#[test]
+fn choosing_deck_scope_returns_typing_to_the_instruction_box() {
+    let hub = listening();
+    let (mut h, shape) = window(Some(hub.clone()));
+    h.state_mut().run("edit.select", json!({"ids": [shape]})).unwrap();
+    h.state_mut().run(COMMAND, json!({})).unwrap();
+    steps(&mut h);
+    h.get_by_value("Current selection").click();
+    steps(&mut h);
+    h.get_by_label("Entire presentation").click();
+    steps(&mut h);
+    let before = h.state().session.active().unwrap().doc.clone();
+    h.event(egui::Event::Text("Restyle the whole deck".into()));
+    steps(&mut h);
+    key(&mut h, Key::Enter, Modifiers::NONE);
+    let request = hub.listen(1, ms(1), || true).expect("scope choice must keep typing in the instruction box");
+    assert_eq!(request.selection["kind"], "deck");
+    assert_eq!(request.instruction, "Restyle the whole deck");
+    assert_eq!(h.state().session.active().unwrap().doc, before, "typing in Ask Agent does not edit the slide");
+}

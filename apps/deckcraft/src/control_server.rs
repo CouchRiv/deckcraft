@@ -88,20 +88,24 @@ fn peer_open(s: &TcpStream) -> bool {
 }
 
 /// While an engine command waits for the UI, disconnects still release ownership promptly.
-fn wait_for_ui(rx: &Receiver<Value>, probe: &TcpStream) -> Option<Value> {
+fn wait_for_ui(rx: &Receiver<Value>, probe: &TcpStream, agents: &AgentHub, conn: u64, owns_request: bool) -> Option<Value> {
     let deadline = Instant::now() + Duration::from_secs(60);
+    let mut input_closed = false;
     loop {
-        if !peer_open(probe) {
-            return None;
+        if !input_closed && !peer_open(probe) {
+            agents.disconnect(conn);
+            if owns_request {
+                return None;
+            }
+            // Generic clients may close only their write half and still await the response.
+            input_closed = true;
         }
         let Some(left) = deadline.checked_duration_since(Instant::now()) else {
             return Some(json!({"ok": false, "error": "timeout"}));
         };
         match rx.recv_timeout(left.min(Duration::from_millis(250))) {
             Ok(reply) => return Some(reply),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Some(json!({"ok": false, "error": "control channel closed"}));
-            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Some(json!({"ok": false, "error": "control channel closed"})),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
@@ -241,6 +245,7 @@ fn serve(stream: TcpStream, token: &str, tx: Sender<ControlRequest>, ctx: egui::
                     }
                     continue;
                 }
+                let owns_request = agents.working_for(conn).is_some();
                 let agent_connection = params.get("request").is_some().then_some(conn);
                 let (mut req, rrx) = ControlRequest::new(method, params);
                 req.agent_connection = agent_connection;
@@ -248,7 +253,7 @@ fn serve(stream: TcpStream, token: &str, tx: Sender<ControlRequest>, ctx: egui::
                     break;
                 }
                 ctx.request_repaint();
-                let Some(mut r) = wait_for_ui(&rrx, &probe) else {
+                let Some(mut r) = wait_for_ui(&rrx, &probe, agents, conn, owns_request) else {
                     break;
                 };
                 if let Some(o) = r.as_object_mut() {
@@ -546,5 +551,19 @@ mod tests {
             _ => panic!("unexpected screenshot"),
         }
         assert_eq!(app.session.active().unwrap().doc, before, "a queued command from the lost owner cannot run");
+    }
+    #[test]
+    fn generic_half_closed_clients_still_receive_their_reply() {
+        let (port, rx, agents) = boot();
+        let mut c = Conn::authed(port);
+        assert_eq!(c.call(&json!({"id": 1, "method": "agent.listen", "params": {"timeoutMs": 0}}))["result"]["none"], true);
+        assert!(agents.agent_present());
+        c.send(&json!({"id": 2, "method": "engine.execute", "params": {"command": "slide.new", "params": {}}}));
+        c.1.shutdown(std::net::Shutdown::Write).unwrap();
+        let request = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        until(|| !agents.agent_present());
+        assert!(!agents.agent_present(), "closed passive agents stop counting too");
+        request.reply.send(json!({"ok": true, "result": {"generic": true}})).unwrap();
+        assert_eq!(c.recv()["result"]["generic"], true, "closing only the write half still allows reading the response");
     }
 }

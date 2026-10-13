@@ -378,7 +378,19 @@ impl AgentHub {
         let s = self.lock();
         s.listeners > 0
             || s.agents.iter().any(|(_, seen)| now - seen < PRESENCE_MS)
-            || s.requests.iter().any(|r| r.state == State::Working && r.taken_by.is_some_and(|c| s.agents.iter().any(|(a, _)| *a == c)))
+            || s.requests.iter().any(|r| r.state == State::Working && r.taken_by.is_some())
+    }
+
+    /// Idle presence expires without pointer input. Waiting listeners and owned work repaint
+    /// through changed(); only the recent-connection grace period needs a timed refresh.
+    pub fn presence_refresh_after(&self) -> Option<std::time::Duration> {
+        let s = self.lock();
+        if s.listeners > 0 || s.requests.iter().any(|r| r.state == State::Working && r.taken_by.is_some()) {
+            return None;
+        }
+        let newest = s.agents.iter().map(|(_, seen)| *seen).max_by(f64::total_cmp)?;
+        let left = newest + PRESENCE_MS - crate::now_ms();
+        (left > 0.0).then(|| std::time::Duration::from_millis(left.ceil().clamp(1.0, PRESENCE_MS) as u64))
     }
 }
 
@@ -975,6 +987,9 @@ pub fn chip_visible(app: &SlideApp, ctx: &egui::Context) -> bool {
 /// bottom-right corner. Drawn after the canvas, which sets the anchor.
 pub fn show(app: &mut SlideApp, ctx: &egui::Context) {
     sync_document(app);
+    if let Some(delay) = app.ask_agent.hub.as_ref().and_then(AgentHub::presence_refresh_after) {
+        ctx.request_repaint_after(delay);
+    }
     let Some(viewport) = app.canvas_rect.filter(|v| v.is_finite() && v.is_positive()) else { return };
     // The bubble belongs to the canvas: gone with it (another view, the start screen, a show).
     if app.show.is_some() || app.home_open() || app.session.active().is_none() {
@@ -1068,6 +1083,7 @@ fn show_bubble(app: &mut SlideApp, ctx: &egui::Context, viewport: Rect) -> Optio
             }
             match &current {
                 None => {
+                    let mut scope_changed = false;
                     if let Some(b) = app.ask_agent.bubble.as_mut() {
                         egui::ComboBox::from_id_salt("dc_agent_scope")
                             .selected_text(match b.scope {
@@ -1076,9 +1092,9 @@ fn show_bubble(app: &mut SlideApp, ctx: &egui::Context, viewport: Rect) -> Optio
                                 _ => "Current selection",
                             })
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut b.scope, "selection", "Current selection");
-                                ui.selectable_value(&mut b.scope, "slide", "This slide");
-                                ui.selectable_value(&mut b.scope, "deck", "Entire presentation");
+                                scope_changed |= ui.selectable_value(&mut b.scope, "selection", "Current selection").changed();
+                                scope_changed |= ui.selectable_value(&mut b.scope, "slide", "This slide").changed();
+                                scope_changed |= ui.selectable_value(&mut b.scope, "deck", "Entire presentation").changed();
                             });
                         let description = match b.scope {
                             "deck" => "The agent gets the entire presentation.",
@@ -1098,7 +1114,7 @@ fn show_bubble(app: &mut SlideApp, ctx: &egui::Context, viewport: Rect) -> Optio
                     let edit = ui.add(
                         egui::TextEdit::multiline(&mut b.text).id(edit_id).hint_text("Ask agent to…").desired_rows(2).desired_width(f32::INFINITY),
                     );
-                    if !b.focused {
+                    if !b.focused || scope_changed {
                         edit.request_focus();
                         b.focused = true;
                     }
