@@ -26,7 +26,7 @@ inspect_slide to read back ids, boxes and text → render_slide to look at the r
 run_command edit.select {ids:[…]}; formatting commands (format.*, shape.fill, shape.line…) act on the selection or \
 on `ids`. Save with save_presentation (.deckcraft or .pptx). Ask Agent: when connected to the app, wait_for_request \
 returns what the person asks from the DeckCraft window (an instruction about the shapes, text or slide they selected); \
-send a short progress note with reply_to_request (done: false) at once, do it, then answer with reply_to_request.";
+send a short progress note with reply_to_request (done: false) at once, do it, then answer with reply_to_request. Requests carry action (null or {id, label, scope}) and apply; replyOnly forbids changes. Each request is one Undo step; leave Keep / Undo to the person.";
 
 /// Resource URIs.
 pub const DOC_URI: &str = "deckcraft://document";

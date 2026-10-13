@@ -96,6 +96,9 @@ pub struct Request {
     pub selection: Value,
     /// `{title, saved, slides, language}`.
     pub document: Value,
+    pub action: Value,
+    pub apply: &'static str,
+    pub review: Option<&'static str>,
     pub state: State,
     /// The agent's latest text: its answer, or a progress note while it works.
     pub reply: String,
@@ -108,7 +111,7 @@ pub struct Request {
 impl Request {
     /// What `agent.listen` hands the agent.
     pub fn to_json(&self) -> Value {
-        json!({"id": self.id, "instruction": self.instruction, "selection": self.selection, "document": self.document})
+        json!({"id": self.id, "instruction": self.instruction, "selection": self.selection, "document": self.document, "action": self.action, "apply": self.apply})
     }
     fn summary(&self) -> Summary {
         Summary {
@@ -118,6 +121,9 @@ impl Request {
             reply: self.reply.clone(),
             asked_ms: self.asked_ms,
             document: self.document.clone(),
+            action: self.action.clone(),
+            apply: self.apply,
+            review: self.review,
         }
     }
 }
@@ -131,6 +137,9 @@ pub struct Summary {
     pub reply: String,
     asked_ms: f64,
     pub document: Value,
+    pub action: Value,
+    pub apply: &'static str,
+    pub review: Option<&'static str>,
 }
 
 struct Inner {
@@ -218,6 +227,10 @@ impl AgentHub {
 
     /// Queue a request; its id. An instruction that is empty once trimmed is refused.
     pub fn ask(&self, instruction: &str, selection: Value, document: Value) -> Result<u64, String> {
+        self.ask_with_action(instruction, selection, document, Value::Null, "auto")
+    }
+
+    pub fn ask_with_action(&self, instruction: &str, selection: Value, document: Value, action: Value, apply: &'static str) -> Result<u64, String> {
         let instruction = cap_chars(instruction.trim(), MAX_TEXT_CHARS);
         if instruction.is_empty() {
             return Err("type an instruction for the agent first".into());
@@ -230,6 +243,9 @@ impl AgentHub {
             instruction,
             selection,
             document,
+            action,
+            apply,
+            review: None,
             state: State::Waiting,
             reply: String::new(),
             taken_by: None,
@@ -368,6 +384,14 @@ impl AgentHub {
 
     pub fn working_for(&self, conn: u64) -> Option<u64> {
         self.lock().requests.iter().find(|r| r.state == State::Working && r.taken_by == Some(conn)).map(|r| r.id)
+    }
+
+    fn reviewed(&self, id: u64, review: &'static str) {
+        let mut s = self.lock();
+        if let Some(r) = s.requests.iter_mut().find(|r| r.id == id && !r.state.open()) {
+            r.review = Some(review);
+        }
+        self.changed(s);
     }
 
     /// Whether an agent is there: one waits in `agent.listen`, an open connection listened or
@@ -542,6 +566,9 @@ pub fn run_for(app: &mut SlideApp, request: u64, id: &str, params: Value) -> Res
         return Err("Ask Agent request is closed or cancelled".into());
     }
     let spec = deckcraft_engine::cmd::find_command(id).ok_or("Ask Agent edits must use engine commands")?;
+    if r.apply == "replyOnly" && spec.undoable {
+        return Err("this Ask Agent request is reply-only; do not change the presentation".into());
+    }
     if id.starts_with("file.") || matches!(id, "edit.undo" | "edit.redo" | "text.compose" | "text.commit") {
         return Err("file, history and composition commands cannot run for an Ask Agent request".into());
     }
@@ -642,7 +669,7 @@ impl AskAgent {
             .hub
             .iter()
             .flat_map(AgentHub::summaries)
-            .map(|r| json!({"id": r.id, "state": r.state.name(), "instruction": r.instruction, "reply": r.reply, "document": r.document}))
+            .map(|r| json!({"id": r.id, "state": r.state.name(), "instruction": r.instruction, "reply": r.reply, "document": r.document, "action": r.action, "apply": r.apply, "review": r.review}))
             .collect();
         json!({
             "available": why.is_none(),
@@ -651,6 +678,7 @@ impl AskAgent {
             "bubble": self.bubble.as_ref().map(|b| json!({"request": b.request})),
             "history": self.history,
             "requests": requests,
+            "actions": crate::agent_actions::ACTIONS.iter().map(|a| json!({"id": a.id, "label": a.label, "menu": a.menu, "scope": a.scope, "instruction": a.instruction, "apply": a.apply})).collect::<Vec<_>>(),
         })
     }
 }
@@ -785,11 +813,84 @@ pub fn document(st: &DocState) -> Value {
     json!({"id": st.uid, "title": title, "saved": st.path.is_some(), "slides": st.doc.slides.len(), "language": language(st)})
 }
 
+fn action_enabled(action: &crate::agent_actions::Action, selection: &Value) -> bool {
+    if action.id == "animation.buildBullets"
+        && selection["kind"] == "text"
+        && (selection["text"]["notes"] == true || !selection["text"]["cell"].is_null())
+    {
+        return false;
+    }
+    match action.scope {
+        "deck" => true,
+        "slide" => !selection["slide"].is_null(),
+        "shape" => selection["shapes"].as_array().is_some_and(|s| s.len() == 1),
+        "text" => {
+            selection["kind"] == "text"
+                || selection["shapes"].as_array().is_some_and(|s| s.iter().any(|sh| sh.get("text").is_some_and(|t| !t.is_null())))
+        }
+        _ => false,
+    }
+}
+
+fn queue_action(app: &mut SlideApp, id: &str, origin: Option<(Value, Value)>) -> Result<u64, String> {
+    let action = crate::agent_actions::find(id).ok_or_else(|| format!("unknown Ask Agent action `{id}`"))?;
+    let st = app.session.active().ok_or("open a presentation first")?;
+    let (selected, doc) = origin.unwrap_or_else(|| (selection(st), document(st)));
+    if doc["id"].as_u64() != Some(st.uid) {
+        return Err("switch back to the presentation this action belongs to".into());
+    }
+    if !action_enabled(action, &selected) {
+        return Err(format!("select {} content before choosing {}", action.scope, action.label));
+    }
+    let selected = match action.scope {
+        "deck" => {
+            json!({"kind": "deck", "slides": st.doc.slides.iter().enumerate().take(MAX_SHAPES).map(|(i, _)| slide_json(st, i)).collect::<Vec<_>>(), "truncated": st.doc.slides.len() > MAX_SHAPES})
+        }
+        "slide" => json!({"kind": "slide", "slide": selected["slide"]}),
+        _ => selected,
+    };
+    let hub = app.ask_agent.hub.as_ref().ok_or("Ask Agent needs the desktop control channel")?;
+    let id =
+        hub.ask_with_action(action.instruction, selected, doc, json!({"id": action.id, "label": action.label, "scope": action.scope}), action.apply)?;
+    remember(&mut app.ask_agent.history, action.label);
+    Ok(id)
+}
+
+fn review(app: &mut SlideApp, id: u64, undo: bool) -> Result<Value, String> {
+    let hub = app.ask_agent.hub.clone().ok_or("Ask Agent needs the desktop control channel")?;
+    let r = hub.request(id).ok_or("unknown Ask Agent request")?;
+    if r.state.open() {
+        return Err("wait for the request to finish, or cancel it before reviewing".into());
+    }
+    if undo {
+        let e = app.ask_agent.edits.get(&id).ok_or("this request has no edits left to undo")?;
+        let st = app.session.active().ok_or("open the request's presentation first")?;
+        if st.uid != e.uid
+            || !Arc::ptr_eq(&st.doc, &e.after)
+            || st.history.undo.len() != e.undo_len + 1
+            || st.history.undo.last().is_none_or(|entry| entry.label != "Ask Agent" || !Arc::ptr_eq(&entry.doc, &e.before))
+            || st.composition.is_some()
+            || st.interaction.is_some()
+        {
+            return Err("the presentation changed after this request; Undo would affect unrelated work".into());
+        }
+        app.run("edit.undo", json!({}))?;
+    }
+    app.ask_agent.edits.remove(&id);
+    hub.reviewed(id, if undo { "undone" } else { "kept" });
+    Ok(json!({"id": id, "review": if undo { "undone" } else { "kept" }}))
+}
+
 /// `app.askAgent`. No params: open the bubble at the selection (refused, with the reason, when
 /// no agent is listening). `instruction`: send it without the bubble. `cancel`: cancel that
 /// request. `close`: close the bubble.
 pub fn command(app: &mut SlideApp, p: &Value) -> Result<Value, String> {
     sync_document(app);
+    for (key, undo) in [("keep", false), ("undo", true)] {
+        if let Some(id) = p.get(key) {
+            return review(app, id.as_u64().ok_or("review takes a request id")?, undo);
+        }
+    }
     if let Some(id) = p.get("cancel") {
         let id = id.as_u64().ok_or("`cancel` is a request id")?;
         let cancelled = app.ask_agent.hub.as_ref().is_some_and(|h| h.cancel(id));
@@ -803,6 +904,9 @@ pub fn command(app: &mut SlideApp, p: &Value) -> Result<Value, String> {
         return Err(app.ask_agent.unavailable().unwrap_or(Unavailable::NoControlChannel).message());
     };
     let Some(st) = app.session.active() else { return Err("open a presentation first".into()) };
+    if let Some(action) = p.get("action") {
+        return queue_action(app, action.as_str().ok_or("action must be an action id")?, None).map(|id| json!({"id": id}));
+    }
     if let Some(text) = p.get("instruction") {
         let text = text.as_str().ok_or("`instruction` is text")?;
         let selected = match p.get("scope").and_then(Value::as_str) {
@@ -908,6 +1012,45 @@ fn send(app: &mut SlideApp, ctx: &egui::Context) {
         }
         Err(e) => app.set_status(e),
     }
+}
+
+fn send_action(app: &mut SlideApp, ctx: &egui::Context, action: &'static str) {
+    let origin = app.ask_agent.bubble.as_ref().map(|b| (b.selection.clone(), b.document.clone()));
+    match queue_action(app, action, origin) {
+        Ok(id) => {
+            if let Some(b) = app.ask_agent.bubble.as_mut() {
+                b.request = Some(id);
+                b.text.clear();
+            }
+            ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+        }
+        Err(e) => app.set_status(e),
+    }
+}
+
+fn quick_actions(ui: &mut egui::Ui, selection: &Value) -> Option<&'static str> {
+    let mut clicked = None;
+    ui.horizontal_wrapped(|ui| {
+        for menu in ["Rewrite", "Text", "Translate", "Design", "Images", "Animations", "Deck"] {
+            ui.menu_button(menu, |ui| {
+                for a in crate::agent_actions::ACTIONS.iter().filter(|a| a.menu == menu) {
+                    if ui.add_enabled(action_enabled(a, selection), egui::Button::new(a.label)).clicked() {
+                        clicked = Some(a.id);
+                        ui.close();
+                    }
+                }
+            });
+        }
+    });
+    clicked
+}
+
+fn instruction_label(r: &Summary) -> &str {
+    r.action.get("label").and_then(Value::as_str).unwrap_or(&r.instruction)
 }
 
 /// Where the bubble goes: below `anchor`, inside the canvas; above it when there is no room
@@ -1075,95 +1218,117 @@ fn show_bubble(app: &mut SlideApp, ctx: &egui::Context, viewport: Rect) -> Optio
     let mut act = BubbleAct::None;
     let t = Tokens::get(ctx);
     let history = app.ask_agent.history.clone();
-    let shown = egui::Area::new(egui::Id::new("dc_ask_agent")).order(Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
-        card(&t).show(ui, |ui| {
-            ui.set_width(width);
-            if header(ui, &t) {
-                act = BubbleAct::Close;
-            }
-            match &current {
-                None => {
-                    let mut scope_changed = false;
-                    if let Some(b) = app.ask_agent.bubble.as_mut() {
-                        egui::ComboBox::from_id_salt("dc_agent_scope")
-                            .selected_text(match b.scope {
-                                "deck" => "Entire presentation",
-                                "slide" => "This slide",
-                                _ => "Current selection",
-                            })
-                            .show_ui(ui, |ui| {
-                                scope_changed |= ui.selectable_value(&mut b.scope, "selection", "Current selection").changed();
-                                scope_changed |= ui.selectable_value(&mut b.scope, "slide", "This slide").changed();
-                                scope_changed |= ui.selectable_value(&mut b.scope, "deck", "Entire presentation").changed();
-                            });
-                        let description = match b.scope {
-                            "deck" => "The agent gets the entire presentation.",
-                            "slide" => "The agent gets this slide.",
-                            _ => &about,
-                        };
-                        ui.label(egui::RichText::new(description).small().color(t.text_dim));
-                    }
-                    // Enter sends, Shift+Enter starts a new line, Up in an empty box brings back
-                    // the last instruction.
-                    let enter = typing && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
-                    let Some(b) = app.ask_agent.bubble.as_mut() else { return };
-                    let up = typing && b.text.is_empty() && !history.is_empty() && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp));
-                    if let (true, Some(last)) = (up, history.first()) {
-                        b.text = last.clone();
-                    }
-                    let edit = ui.add(
-                        egui::TextEdit::multiline(&mut b.text).id(edit_id).hint_text("Ask agent to…").desired_rows(2).desired_width(f32::INFINITY),
-                    );
-                    if !b.focused || scope_changed {
-                        edit.request_focus();
-                        b.focused = true;
-                    }
-                    if up {
-                        // The caret at the end of the recalled text.
-                        let end = b.text.chars().count();
-                        if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), edit_id) {
-                            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(end))));
-                            state.store(ui.ctx(), edit_id);
+    let shown = egui::Area::new(egui::Id::new("dc_ask_agent"))
+        .order(Order::Foreground)
+        .default_size(vec2(width, 300.0))
+        .constrain_to(viewport)
+        .fixed_pos(pos)
+        .show(ctx, |ui| {
+            card(&t).show(ui, |ui| {
+                ui.set_width(width);
+                if header(ui, &t) {
+                    act = BubbleAct::Close;
+                }
+                match &current {
+                    None => {
+                        let mut scope_changed = false;
+                        if let Some(b) = app.ask_agent.bubble.as_mut() {
+                            egui::ComboBox::from_id_salt("dc_agent_scope")
+                                .selected_text(match b.scope {
+                                    "deck" => "Entire presentation",
+                                    "slide" => "This slide",
+                                    _ => "Current selection",
+                                })
+                                .show_ui(ui, |ui| {
+                                    scope_changed |= ui.selectable_value(&mut b.scope, "selection", "Current selection").changed();
+                                    scope_changed |= ui.selectable_value(&mut b.scope, "slide", "This slide").changed();
+                                    scope_changed |= ui.selectable_value(&mut b.scope, "deck", "Entire presentation").changed();
+                                });
+                            let description = match b.scope {
+                                "deck" => "The agent gets the entire presentation.",
+                                "slide" => "The agent gets this slide.",
+                                _ => &about,
+                            };
+                            ui.label(egui::RichText::new(description).small().color(t.text_dim));
                         }
-                    }
-                    ui.label(egui::RichText::new("Enter to send, Shift+Enter for a new line").small().color(t.text_faint));
-                    let has_text = !b.text.trim().is_empty();
-                    if !has_text && !history.is_empty() {
-                        ui.label(egui::RichText::new("Recent").small().color(t.text_dim));
-                        for h in history.iter().take(HISTORY_SHOWN) {
-                            // A recent instruction fills the box, to send as it is or change first.
-                            if ui.add(egui::Label::new(h.as_str()).truncate().sense(egui::Sense::click())).on_hover_text(h.as_str()).clicked() {
-                                b.text = h.clone();
-                                edit.request_focus();
+                        // Enter sends, Shift+Enter starts a new line, Up in an empty box brings back
+                        // the last instruction.
+                        let enter = typing && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+                        let Some(b) = app.ask_agent.bubble.as_mut() else { return };
+                        let up = typing && b.text.is_empty() && !history.is_empty() && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp));
+                        if let (true, Some(last)) = (up, history.first()) {
+                            b.text = last.clone();
+                        }
+                        let edit = ui.add(
+                            egui::TextEdit::multiline(&mut b.text)
+                                .id(edit_id)
+                                .hint_text("Ask agent to…")
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY),
+                        );
+                        if !b.focused || scope_changed {
+                            edit.request_focus();
+                            b.focused = true;
+                        }
+                        if up {
+                            // The caret at the end of the recalled text.
+                            let end = b.text.chars().count();
+                            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), edit_id) {
+                                state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(end))));
+                                state.store(ui.ctx(), edit_id);
                             }
                         }
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(has_text, egui::Button::new("Send")).clicked() || (enter && has_text) {
-                            act = BubbleAct::Send;
+                        ui.label(egui::RichText::new("Enter to send, Shift+Enter for a new line").small().color(t.text_faint));
+                        let has_text = !b.text.trim().is_empty();
+                        if !has_text && !history.is_empty() {
+                            ui.label(egui::RichText::new("Recent").small().color(t.text_dim));
+                            for h in history.iter().take(HISTORY_SHOWN) {
+                                // A recent instruction fills the box, to send as it is or change first.
+                                if ui.add(egui::Label::new(h.as_str()).truncate().sense(egui::Sense::click())).on_hover_text(h.as_str()).clicked() {
+                                    b.text = h.clone();
+                                    edit.request_focus();
+                                }
+                            }
                         }
-                        if ui.button("Cancel").clicked() {
-                            act = BubbleAct::Close;
-                        }
-                    });
-                }
-                Some(r) => {
-                    // The instruction, in grey, then where it stands.
-                    ui.add(egui::Label::new(egui::RichText::new(&r.instruction).small().color(t.text_dim)).truncate()).on_hover_text(&r.instruction);
-                    status(ui, r, present, &t);
-                    ui.horizontal(|ui| {
-                        if r.state.open() {
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(has_text, egui::Button::new("Send")).clicked() || (enter && has_text) {
+                                act = BubbleAct::Send;
+                            }
                             if ui.button("Cancel").clicked() {
-                                act = BubbleAct::Cancel(r.id);
+                                act = BubbleAct::Close;
                             }
-                        } else if ui.button("Close").clicked() {
-                            act = BubbleAct::Close;
+                        });
+                        if let Some(action) = quick_actions(ui, &b.selection) {
+                            act = BubbleAct::Action(action);
                         }
-                    });
+                    }
+                    Some(r) => {
+                        // The instruction, in grey, then where it stands.
+                        ui.add(egui::Label::new(egui::RichText::new(instruction_label(r)).small().color(t.text_dim)).truncate());
+                        status(ui, r, present, &t);
+                        ui.horizontal(|ui| {
+                            if r.state.open() {
+                                if ui.button("Cancel").clicked() {
+                                    act = BubbleAct::Cancel(r.id);
+                                }
+                            } else {
+                                if app.ask_agent.edits.contains_key(&r.id) {
+                                    if ui.button("Keep").clicked() {
+                                        act = BubbleAct::Keep(r.id);
+                                    }
+                                    if ui.button("Undo").clicked() {
+                                        act = BubbleAct::Undo(r.id);
+                                    }
+                                }
+                                if ui.button("Close").clicked() {
+                                    act = BubbleAct::Close;
+                                }
+                            }
+                        });
+                    }
                 }
-            }
+            });
         });
-    });
     // Escape in the box, or a press in the canvas outside the bubble, closes it.
     let rect = shown.response.rect;
     let press = ctx.input(|i| if i.pointer.any_pressed() { i.pointer.press_origin() } else { None });
@@ -1175,6 +1340,13 @@ fn show_bubble(app: &mut SlideApp, ctx: &egui::Context, viewport: Rect) -> Optio
     match act {
         BubbleAct::None => {}
         BubbleAct::Send => send(app, ctx),
+        BubbleAct::Action(action) => send_action(app, ctx, action),
+        BubbleAct::Keep(id) => {
+            let _ = app.run(COMMAND, json!({"keep": id}));
+        }
+        BubbleAct::Undo(id) => {
+            let _ = app.run(COMMAND, json!({"undo": id}));
+        }
         BubbleAct::Close => close_bubble(app),
         BubbleAct::Cancel(id) => {
             if let Some(h) = &app.ask_agent.hub {
@@ -1190,12 +1362,21 @@ enum BubbleAct {
     Send,
     Close,
     Cancel(u64),
+    Action(&'static str),
+    Keep(u64),
+    Undo(u64),
 }
 
 /// A request's state, live: "Sent to your agent" the moment it is sent, "Your agent is working"
 /// as soon as the agent has it, with a spinner and the time since it was sent; the agent's latest
 /// progress note; then its answer, whole (it wraps, and scrolls when long), or Cancelled.
 fn status(ui: &mut egui::Ui, r: &Summary, present: bool, t: &Tokens) {
+    if let Some(review) = r.review {
+        ui.label(match review {
+            "undone" => "Changes undone",
+            _ => "Changes kept",
+        });
+    }
     let secs = ((crate::now_ms() - r.asked_ms) / 1000.0).max(0.0) as u64;
     let busy = |ui: &mut egui::Ui, text: &str| {
         ui.horizontal(|ui| {
@@ -1275,6 +1456,7 @@ fn show_requests(app: &mut SlideApp, ctx: &egui::Context, viewport: Rect, in_bub
     }
     let present = hub.agent_present();
     let t = Tokens::get(ctx);
+    let mut review_action = None;
     egui::Area::new(egui::Id::new("dc_ask_agent_requests"))
         .order(Order::Foreground)
         .pivot(Align2::RIGHT_BOTTOM)
@@ -1285,14 +1467,26 @@ fn show_requests(app: &mut SlideApp, ctx: &egui::Context, viewport: Rect, in_bub
                 let close = header(ui, &t);
                 for r in requests.iter().rev().take(SHOWN).rev() {
                     ui.separator();
-                    ui.add(egui::Label::new(egui::RichText::new(&r.instruction).small().color(t.text_dim)).truncate());
+                    ui.add(egui::Label::new(egui::RichText::new(instruction_label(r)).small().color(t.text_dim)).truncate());
                     status(ui, r, present, &t);
                     if r.state.open() {
                         if ui.small_button("Cancel").clicked() {
                             hub.cancel(r.id);
                         }
-                    } else if ui.small_button("Dismiss").clicked() {
-                        hub.dismiss(r.id);
+                    } else {
+                        ui.horizontal(|ui| {
+                            if app.ask_agent.edits.contains_key(&r.id) {
+                                if ui.small_button("Keep").clicked() {
+                                    review_action = Some((r.id, false));
+                                }
+                                if ui.small_button("Undo").clicked() {
+                                    review_action = Some((r.id, true));
+                                }
+                            }
+                            if ui.small_button("Dismiss").clicked() {
+                                hub.dismiss(r.id);
+                            }
+                        });
                     }
                 }
                 // Closing the card puts away the answered and cancelled requests; open ones stay.
@@ -1303,6 +1497,9 @@ fn show_requests(app: &mut SlideApp, ctx: &egui::Context, viewport: Rect, in_bub
                 }
             });
         });
+    if let Some((id, undo)) = review_action {
+        let _ = app.run(COMMAND, if undo { json!({"undo": id}) } else { json!({"keep": id}) });
+    }
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod agent_actions;
 pub mod ask_agent;
 pub mod canvas;
 pub mod control;
@@ -171,7 +172,7 @@ pub const UI_COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         ask_agent::COMMAND,
         "Ask Agent…",
         Some(ask_agent::SHORTCUT),
-        "{instruction?: text (send without the bubble), scope?: slide|deck, cancel?: request id, close?: bool}",
+        "{instruction?: text, scope?: slide|deck, action?: id, cancel?: request id, keep?: id, undo?: id, close?: bool}",
     ),
 ];
 

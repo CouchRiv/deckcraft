@@ -302,11 +302,11 @@ pub fn tool_definitions() -> Vec<Value> {
 
 const WAIT_DESCRIPTION: &str = "Ask Agent: wait for the next request the person sends from the DeckCraft window (they \
 select shapes, text in a shape, or nothing for the whole slide, click Ask Agent or press Ctrl+Shift+O, and type an \
-instruction such as \"make this slide punchier\"). Returns {id, instruction, selection, document}, or {none: true} when \
+instruction such as \"make this slide punchier\"). Returns {id, instruction, selection, document, action, apply}, or {none: true} when \
 nothing came within timeout_s (this server answers nothing else while it waits). selection.kind is \"text\" (text.shape, \
 text.anchor and text.caret as [paragraph, character], text.text; text.notes for the speaker notes), \"shapes\" (shapes: \
 id, kind, box, text… as inspect_slide gives them) or \"slide\" / \"deck\"; selection.slide is {index, id, title}. document is \
-{id, title, saved, slides, language}. The person is watching the bubble: first call reply_to_request {id, text: \
+{id, title, saved, slides, language}. action is null for typed requests or {id, label, scope} for a quick action; apply is auto or replyOnly (never modify replyOnly). Follow the supplied instruction using existing commands and leave Keep / Undo to the person. The person is watching the bubble: first call reply_to_request {id, text: \
 \"Rewriting…\", done: false} at once with a few words on what you are doing, then do it with the other tools (the \
 person may have moved since: go_to_slide {index}, select {ids}, or run_command text.edit {id} then text.select {anchor, \
 caret} brings the selection back; check with inspect_slide or render_slide), then call reply_to_request with a short \

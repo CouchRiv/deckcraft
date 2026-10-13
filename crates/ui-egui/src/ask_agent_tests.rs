@@ -649,6 +649,140 @@ fn escape_for_a_dialog_and_ime_typing_never_cancel_a_request() {
 }
 
 #[test]
+fn actions_carry_metadata_and_their_declared_scope() {
+    let (mut app, hub, shape, _) = request_app();
+    app.run("edit.select", json!({"ids": [shape]})).unwrap();
+    for a in crate::agent_actions::ACTIONS {
+        let id = app.run(COMMAND, json!({"action": a.id})).unwrap()["id"].as_u64().unwrap();
+        let r = hub.request(id).unwrap();
+        assert_eq!(r.action["id"], a.id);
+        assert_eq!(r.action["label"], a.label);
+        assert_eq!(r.apply, a.apply);
+        assert_eq!(r.instruction, a.instruction);
+        assert_eq!(
+            r.selection["kind"],
+            match a.scope {
+                "deck" => "deck",
+                "slide" => "slide",
+                _ => "shapes",
+            }
+        );
+        hub.cancel(id);
+    }
+    let inspected = app.ask_agent.inspect();
+    assert_eq!(inspected["actions"].as_array().unwrap().len(), 32);
+    app.run("edit.select", json!({"ids": []})).unwrap();
+    assert!(app.run(COMMAND, json!({"action": "text.shorten"})).is_err());
+    assert!(app.run(COMMAND, json!({"action": "missing"})).is_err());
+}
+
+#[test]
+fn keep_and_undo_review_only_the_requests_own_edits() {
+    let (mut app, hub, shape, id) = request_app();
+    let before = app.session.active().unwrap().doc.clone();
+    run_for(&mut app, id, "shape.move", json!({"ids": [shape], "dx": 5})).unwrap();
+    run_for(&mut app, id, "shape.fill", json!({"ids": [shape], "color": "#123456"})).unwrap();
+    assert!(app.run(COMMAND, json!({"undo": id})).is_err(), "cannot review an open request");
+    hub.reply(1, id, "Done", true).unwrap();
+    app.run(COMMAND, json!({"undo": id})).unwrap();
+    assert_eq!(app.session.active().unwrap().doc, before);
+    assert_eq!(hub.request(id).unwrap().review, Some("undone"));
+    app.run("edit.redo", json!({})).unwrap();
+    let edited = app.session.active().unwrap().doc.clone();
+    let next = app.run(COMMAND, json!({"instruction": "move"})).unwrap()["id"].as_u64().unwrap();
+    hub.listen(1, ms(1), || true).unwrap();
+    run_for(&mut app, next, "shape.move", json!({"ids": [shape], "dy": 5})).unwrap();
+    hub.reply(1, next, "Done", true).unwrap();
+    let kept = app.session.active().unwrap().doc.clone();
+    app.run(COMMAND, json!({"keep": next})).unwrap();
+    assert_eq!(app.session.active().unwrap().doc, kept);
+    assert_eq!(hub.request(next).unwrap().review, Some("kept"));
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(app.session.active().unwrap().doc, edited, "regular Undo still works after Keep");
+}
+
+#[test]
+fn result_undo_cannot_erase_later_human_work_and_reply_only_cannot_edit() {
+    let (mut app, hub, shape, id) = request_app();
+    run_for(&mut app, id, "shape.move", json!({"ids": [shape], "dx": 5})).unwrap();
+    hub.reply(1, id, "Done", true).unwrap();
+    app.run("shape.move", json!({"ids": [shape], "dy": 5})).unwrap();
+    let after_person = app.session.active().unwrap().doc.clone();
+    assert!(app.run(COMMAND, json!({"undo": id})).unwrap_err().contains("unrelated"));
+    assert_eq!(app.session.active().unwrap().doc, after_person);
+    let st = app.session.active().unwrap();
+    let reply_only = hub.ask_with_action("explain", selection(st), document(st), Value::Null, "replyOnly").unwrap();
+    hub.listen(1, ms(1), || true).unwrap();
+    assert!(run_for(&mut app, reply_only, "shape.move", json!({"ids": [shape], "dx": 5})).unwrap_err().contains("reply-only"));
+    run_for(&mut app, reply_only, "slide.inspect", json!({})).unwrap();
+    assert_eq!(app.session.active().unwrap().doc, after_person);
+}
+
+#[test]
+fn bubble_menus_send_actions_and_keep_undo_buttons_work_headless() {
+    let hub = listening();
+    let (mut h, shape) = window(Some(hub.clone()));
+    h.state_mut().run("edit.select", json!({"ids": [shape]})).unwrap();
+    h.state_mut().run(COMMAND, json!({})).unwrap();
+    steps(&mut h);
+    h.get_by_label("Text").click();
+    steps(&mut h);
+    h.get_by_label("Shorten").click();
+    steps(&mut h);
+    let r = hub.listen(1, ms(1), || true).unwrap();
+    assert_eq!(r.action["id"], "text.shorten");
+    assert_eq!(r.selection["shapes"][0]["id"], shape);
+    run_for(h.state_mut(), r.id, "shape.move", json!({"ids": [shape], "dx": 5})).unwrap();
+    hub.reply(1, r.id, "Done", true).unwrap();
+    steps(&mut h);
+    assert!(h.query_by_label("Keep").is_some());
+    h.get_by_label("Undo").click();
+    steps(&mut h);
+    assert_eq!(hub.request(r.id).unwrap().review, Some("undone"));
+    h.state_mut().run(COMMAND, json!({})).unwrap();
+    steps(&mut h);
+    h.get_by_label("Translate").click();
+    steps(&mut h);
+    h.get_by_label("French").click();
+    steps(&mut h);
+    assert_eq!(hub.listen(1, ms(1), || true).unwrap().action["id"], "translate.fr");
+}
+
+#[test]
+fn rewrite_notes_and_table_cells_restore_the_captured_range_as_one_undo() {
+    let (mut app, hub, _, first) = request_app();
+    hub.reply(1, first, "No edits", true).unwrap();
+    app.run("slide.notes", json!({"text": "Before notes"})).unwrap();
+    let table = app.run("insert.table", json!({"rows": 1, "cols": 1})).unwrap()["id"].as_u64().unwrap();
+    app.run("text.set", json!({"id": table, "cell": [0, 0], "text": "Before cell"})).unwrap();
+    for notes in [true, false] {
+        app.run("text.edit", if notes { json!({"notes": true}) } else { json!({"id": table, "cell": [0, 0]}) }).unwrap();
+        app.run("text.select", json!({"anchor": [0, 0], "caret": [0, 6]})).unwrap();
+        let id = app.run(COMMAND, json!({"action": "text.shorten"})).unwrap()["id"].as_u64().unwrap();
+        let r = hub.listen(1, ms(1), || true).unwrap();
+        assert_eq!(r.id, id);
+        assert_eq!(r.selection["text"]["text"], "Before");
+        assert_eq!(r.selection["text"]["notes"], notes);
+        assert!(r.instruction.contains("text.get` cannot read notes or table cells"));
+        let before = app.session.active().unwrap().doc.clone();
+        let history = app.session.active().unwrap().history.undo.len();
+        run_for(
+            &mut app,
+            id,
+            "text.edit",
+            if notes { json!({"notes": true}) } else { json!({"id": r.selection["text"]["shape"], "cell": r.selection["text"]["cell"]}) },
+        )
+        .unwrap();
+        run_for(&mut app, id, "text.select", json!({"anchor": r.selection["text"]["anchor"], "caret": r.selection["text"]["caret"]})).unwrap();
+        run_for(&mut app, id, "text.insert", json!({"text": "After"})).unwrap();
+        assert_eq!(app.session.active().unwrap().history.undo.len(), history + 1);
+        hub.reply(1, id, "Done", true).unwrap();
+        app.run(COMMAND, json!({"undo": id})).unwrap();
+        assert_eq!(app.session.active().unwrap().doc, before);
+    }
+}
+
+#[test]
 fn idle_presence_has_an_expiry_repaint_and_owned_work_survives_record_eviction() {
     let hub = AgentHub::new(7979, None);
     assert!(hub.presence_refresh_after().is_none());

@@ -65,7 +65,7 @@ mcp`), both tools say how to start it.
 
 | Date | Change |
 |---|---|
-| 2026-10-13 | Ask Agent requests, replies, document identity and grouped Undo. |
+| 2026-10-13 | Ask Agent requests, replies, document identity, grouped Undo, scoped actions and result review. |
 
 ### One Undo per request
 
@@ -76,6 +76,17 @@ for edits; direct pointer/key/text/UI calls are refused because they bypass grou
 A request stays tied to its original presentation (`document.id`). If the person edits during
 the request, further agent edits are refused: finish with an explanation and ask again.
 Use `run_command app.askAgent {instruction, scope: "deck"}` to queue a whole-deck request.
+
+### Actions and result review
+
+See [Ask Agent actions](ask-agent-actions.md) for the 32-action data catalog, scoped menus,
+`action` / `apply` request metadata, Keep / Undo and the before/after preview design.
+The preview is designed only; Keep / Undo are implemented. All action changes use the same
+single Undo entry as typed requests. `app.askAgent {action: id}` sends an action;
+`{keep: id}` keeps its result; `{undo: id}` refuses if later unrelated edits would be affected.
+Images: 16 MiB decoded; control lines: 24 MiB including newline. Oversized inputs get a clear
+error, and an oversized control line closes that connection. Send separate commands for large
+images; they still belong to the same request and Undo entry.
 
 After a connection or ownership failure, call `wait_for_request` again to reacquire work.
 The bridge forgets stale ownership and blocks edits and replies until a listen returns a

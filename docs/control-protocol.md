@@ -126,7 +126,7 @@ and holds no provider key: the agent is whatever the person connected.
 
 | Date | Change |
 |---|---|
-| 2026-10-13 | Ask Agent requests, replies, document identity and grouped Undo. |
+| 2026-10-13 | Ask Agent requests, replies, document identity, grouped Undo, scoped actions and result review. |
 
 ### Request attribution and document identity
 
@@ -149,6 +149,17 @@ unrelated work into its history. Selection and inspection commands do not create
 File, history, composition and UI commands cannot be attributed. Agent replies are accepted
 only from the connection that currently owns the request; reconnect, listen and reacquire it
 before replying. A cancelled request reports `{cancelled: true}`.
+
+### Actions and result review
+
+See [Ask Agent actions](ask-agent-actions.md) for the 32-action data catalog, scoped menus,
+`action` / `apply` request metadata, Keep / Undo and the before/after preview design.
+The preview is designed only; Keep / Undo are implemented. All action changes use the same
+single Undo entry as typed requests. `app.askAgent {action: id}` sends an action;
+`{keep: id}` keeps its result; `{undo: id}` refuses if later unrelated edits would be affected.
+Images: 16 MiB decoded; control lines: 24 MiB including newline. Oversized inputs get a clear
+error, and an oversized control line closes that connection. Send separate commands for large
+images; they still belong to the same request and Undo entry.
 
 Commands waiting for the window probe their connection every 250 ms. A disconnect releases
 ownership and requeues the request; queued commands from the old connection check ownership

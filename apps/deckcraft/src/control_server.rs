@@ -22,6 +22,22 @@ use deckcraft_ui_egui::{AgentHub, ControlRequest};
 use serde_json::{Value, json};
 
 const AUTH_FIRST: &str = "authenticate first: {\"method\":\"auth\",\"params\":{\"token\":…}}";
+const MAX_CONTROL_BYTES: usize = 24 * 1024 * 1024;
+
+fn read_frame(reader: &mut impl BufRead, limit: usize) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let count = std::io::Read::take(&mut *reader, limit.saturating_add(1) as u64).read_until(b'\n', &mut bytes)?;
+    if count > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "control frame exceeds the 24 MiB limit; send smaller image data or separate commands",
+        ));
+    }
+    if count == 0 {
+        return Ok(None);
+    }
+    String::from_utf8(bytes).map(Some).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
 
 /// Start the control server on `port`; `None` when it can't (no token, port taken, token file
 /// not written): the control channel, and with it Ask Agent, is then off. `agents` is the
@@ -123,9 +139,7 @@ fn agent_method(agents: &AgentHub, conn: u64, method: &str, p: &Value, probe: &T
             None | Some(Value::Null) => DEFAULT_LISTEN_MS,
             Some(v) => match v.as_f64().filter(|ms| ms.is_finite() && *ms >= 0.0) {
                 Some(ms) => (ms as u64).min(MAX_LISTEN_MS),
-                None => {
-                    return (err("`timeoutMs` is a number of milliseconds (at most 60000)"), None);
-                }
+                None => return (err("`timeoutMs` is a number of milliseconds (at most 60000)"), None),
             },
         };
         return match agents.listen(conn, Duration::from_millis(ms), || peer_open(probe)) {
@@ -133,12 +147,8 @@ fn agent_method(agents: &AgentHub, conn: u64, method: &str, p: &Value, probe: &T
             None => (json!({"ok": true, "result": {"none": true}}), None),
         };
     }
-    let Some(id) = p.get("id").and_then(Value::as_u64) else {
-        return (err("missing `id` (the request's id from agent.listen)"), None);
-    };
-    let Some(text) = p.get("text").and_then(Value::as_str) else {
-        return (err("missing `text` (what to show in the window)"), None);
-    };
+    let Some(id) = p.get("id").and_then(Value::as_u64) else { return (err("missing `id` (the request's id from agent.listen)"), None) };
+    let Some(text) = p.get("text").and_then(Value::as_str) else { return (err("missing `text` (what to show in the window)"), None) };
     let done = p.get("done").and_then(Value::as_bool).unwrap_or(true);
     match agents.reply(conn, id, text, done) {
         Ok(v) => (json!({"ok": true, "result": v}), None),
@@ -164,13 +174,19 @@ fn authenticate(line: &str, token: &str) -> (Value, bool) {
 
 fn serve(stream: TcpStream, token: &str, tx: Sender<ControlRequest>, ctx: egui::Context, agents: &AgentHub, conn: u64) {
     let Ok(read) = stream.try_clone() else { return };
-    let Ok(probe) = stream.try_clone() else {
-        return;
-    };
+    let Ok(probe) = stream.try_clone() else { return };
     let mut out = stream;
     let mut authenticated = false;
-    for line in BufReader::new(read).lines() {
-        let Ok(line) = line else { break };
+    let mut reader = BufReader::new(read);
+    loop {
+        let line = match read_frame(&mut reader, MAX_CONTROL_BYTES) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(e) => {
+                let _ = writeln!(out, "{}", json!({"id": null, "ok": false, "error": e.to_string()}));
+                break;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -253,9 +269,7 @@ fn serve(stream: TcpStream, token: &str, tx: Sender<ControlRequest>, ctx: egui::
                     break;
                 }
                 ctx.request_repaint();
-                let Some(mut r) = wait_for_ui(&rrx, &probe, agents, conn, owns_request) else {
-                    break;
-                };
+                let Some(mut r) = wait_for_ui(&rrx, &probe, agents, conn, owns_request) else { break };
                 if let Some(o) = r.as_object_mut() {
                     o.insert("id".into(), id);
                 }
@@ -529,6 +543,35 @@ mod tests {
     }
 
     #[test]
+    fn mcp_requests_include_explicit_action_metadata() {
+        let (port, _rx, agents) = boot();
+        agents.ask("rewrite", shapes_sel(), json!({"title": "Synthetic.deckcraft"})).unwrap();
+        let remote = deckcraft_mcp::Remote::connect_with_token(&format!("127.0.0.1:{port}"), Some(TOKEN.into())).unwrap();
+        let mut server = deckcraft_mcp::Server::new(Box::new(remote));
+        let line = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "wait_for_request", "arguments": {"timeout_s": 1}}})
+            .to_string();
+        let reply: Value = serde_json::from_str(&server.handle_line(&line).unwrap()).unwrap();
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        let payload: Value = serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(payload.as_object().unwrap().contains_key("action"), "typed requests explicitly have action: null: {payload}");
+        assert_eq!(payload["action"], Value::Null);
+        assert_eq!(payload["apply"], "auto");
+    }
+
+    #[test]
+    fn control_frames_are_bounded_before_json_or_utf8_decoding() {
+        let mut reader = std::io::Cursor::new(b"1234567\nrest\n");
+        assert_eq!(read_frame(&mut reader, 8).unwrap(), Some("1234567\n".into()));
+        assert_eq!(read_frame(&mut reader, 8).unwrap(), Some("rest\n".into()));
+        assert!(read_frame(&mut reader, 8).unwrap().is_none());
+        let mut too_long = std::io::Cursor::new(b"123456789");
+        assert!(read_frame(&mut too_long, 8).unwrap_err().to_string().contains("24 MiB"));
+        assert_eq!(too_long.position(), 9, "at most limit + 1 bytes are read");
+        let mut invalid = std::io::Cursor::new([0xff, b'\n']);
+        assert!(read_frame(&mut invalid, 8).is_err());
+    }
+
+    #[test]
     fn disconnect_while_waiting_for_ui_requeues_and_stale_command_is_refused() {
         let (port, rx, agents) = boot();
         let mut app = deckcraft_ui_egui::SlideApp::new(deckcraft_engine::Session::with_new(), deckcraft_ui_egui::Services::default())
@@ -552,6 +595,7 @@ mod tests {
         }
         assert_eq!(app.session.active().unwrap().doc, before, "a queued command from the lost owner cannot run");
     }
+
     #[test]
     fn generic_half_closed_clients_still_receive_their_reply() {
         let (port, rx, agents) = boot();

@@ -217,14 +217,39 @@ fn text_box(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Read media bytes from `data` (base64) or `path`.
+pub const MAX_PICTURE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PICTURE_BASE64: usize = MAX_PICTURE_BYTES.div_ceil(3) * 4;
+
 pub(crate) fn media_bytes(p: &Value, cmd: &str) -> Result<(String, Vec<u8>)> {
+    let picture = matches!(cmd, "insert.picture" | "picture.change" | "shape.fill" | "design.background");
+    let too_large = || bad(cmd, "picture exceeds the 16 MiB limit; supply smaller image bytes");
     if let Some(d) = str_param(p, "data") {
+        if picture && d.len() > MAX_PICTURE_BASE64 {
+            return Err(too_large());
+        }
         let bytes = base64_decode(d).ok_or_else(|| bad(cmd, "invalid base64 `data`"))?;
+        if picture && bytes.len() > MAX_PICTURE_BYTES {
+            return Err(too_large());
+        }
         return Ok((str_param(p, "name").unwrap_or("media").to_string(), bytes));
     }
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(path) = str_param(p, "path") {
-        let bytes = std::fs::read(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        if picture && std::fs::metadata(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?.len() > MAX_PICTURE_BYTES as u64 {
+            return Err(too_large());
+        }
+        let bytes = if picture {
+            use std::io::Read;
+            let file = std::fs::File::open(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+            let mut bytes = Vec::new();
+            file.take(MAX_PICTURE_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+            bytes
+        } else {
+            std::fs::read(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?
+        };
+        if picture && bytes.len() > MAX_PICTURE_BYTES {
+            return Err(too_large());
+        }
         let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "media".into());
         return Ok((name, bytes));
     }
@@ -797,4 +822,27 @@ fn smart_art(s: &mut Session, p: &Value) -> Result<Value> {
         let _ = s.execute("shape.rename", &json!({"id": gid, "name": format!("SmartArt ({kind})")}));
     }
     Ok(g)
+}
+
+#[cfg(test)]
+mod picture_size_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_picture_data_is_refused_before_decoding() {
+        let data = "A".repeat(MAX_PICTURE_BASE64 + 4);
+        for command in ["insert.picture", "picture.change", "shape.fill", "design.background"] {
+            let error = media_bytes(&json!({"data": data}), command).unwrap_err().to_string();
+            assert!(error.contains("16 MiB"), "{error}");
+        }
+    }
+
+    #[test]
+    fn decoded_picture_limit_and_exact_boundary_are_checked() {
+        let error = media_bytes(&json!({"data": "A".repeat(MAX_PICTURE_BASE64)}), "insert.picture").unwrap_err().to_string();
+        assert!(error.contains("16 MiB"), "decoded data exceeds the cap: {error}");
+        let data = base64_encode(&vec![0; MAX_PICTURE_BYTES]);
+        assert_eq!(media_bytes(&json!({"data": data}), "insert.picture").unwrap().1.len(), MAX_PICTURE_BYTES);
+        assert!(media_bytes(&json!({"data": "bad!"}), "insert.picture").unwrap_err().to_string().contains("invalid base64"));
+    }
 }

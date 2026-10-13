@@ -1,6 +1,6 @@
 # Where DeckCraft falls short of PowerPoint
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** minor (AI features: Ask Agent, bring your own agent over MCP, noted; previous: minor, IME composition and CJK interface text landed, #101; before that: minor, core-workflow alpha gate added; stage stays alpha; before that: major, first itemized gap list; full re-measure against PowerPoint for Mac 16.113.4 and the open GitHub issues) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** minor (AI features: Ask Agent scoped actions and Keep / Undo; previous: minor, IME composition and CJK interface text landed, #101; before that: minor, core-workflow alpha gate added; stage stays alpha; before that: major, first itemized gap list; full re-measure against PowerPoint for Mac 16.113.4 and the open GitHub issues) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
 
 Every known shortfall, one entry each, ranked by how much it stops someone who presents with
 PowerPoint from switching. This is the work list: pick from the top. Numbers are summarized in
@@ -252,14 +252,14 @@ Detail in [localization-parity.md](localization-parity.md).
   for subtitles, translation) need an owner decision on licensed models. 20–40 h. Ask Agent hands
   a selection and an instruction to an agent the person already runs (over MCP) and shows its
   answer next to the selection, with no model or key in DeckCraft
-  ([control-protocol.md](control-protocol.md#ask-agent)); quick actions and an in-bubble preview
-  are not there yet.
+  ([control-protocol.md](control-protocol.md#ask-agent)); 32 scoped actions and Keep / Undo are available for text, design, images, animations and
+  deck structure. The side-by-side in-bubble preview is designed only.
 
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-13 | minor | AI features: Ask Agent (bring your own agent over MCP) noted |
+| 2026-10-13 | minor | AI features: Ask Agent with scoped actions and result review |
 | 2026-10-12 | minor | IME composition in slide text and notes, and CJK interface text with real glyphs (#101): the IME gap is now Korean on the web and table-cell underlines |
 | 2026-10-12 | minor | EMF/WMF text, pattern and hatch brushes drawn; legacy OLE and ActiveX previews shown; the SVG gap keeps only EMF clip regions |
 | 2026-10-12 | minor | Text warps render (all 40 presets, adjusts round-trip); the warp gap is now the gallery, command and handles |
