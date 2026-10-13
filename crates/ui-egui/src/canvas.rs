@@ -433,11 +433,16 @@ fn overlays(app: &mut SlideApp, ui: &Ui, painter: &egui::Painter, xf: Xf, t: &To
     let Some(st) = app.session.active() else { return };
     let sel_stroke = Stroke::new(1.0, t.selection);
     let editing = st.selection.text.clone();
+    // Where the selection is on screen, for Ask Agent's chip and bubble.
+    let mut shapes_box: Option<Rect> = None;
+    let mut text_anchor: Option<crate::ask_agent::Anchor> = None;
     for id in &st.selection.shapes {
         let Some(sh) = st.shape(*id) else { continue };
         let x = deckcraft_engine::cmd::xfrm_of(&st.doc, &st.selection, sh);
         let a = x.affine();
         let corners = [Point::new(0.0, 0.0), Point::new(x.w, 0.0), Point::new(x.w, x.h), Point::new(0.0, x.h)].map(|q| xf.to_screen(a * q));
+        let bbox = corners.iter().fold(Rect::NOTHING, |r, p| r.union(Rect::from_min_max(*p, *p)));
+        shapes_box = Some(shapes_box.map_or(bbox, |b| b.union(bbox)));
         if sh.is_line() {
             let (p0, p1) = (xf.to_screen(a * Point::new(0.0, 0.0)), xf.to_screen(a * Point::new(x.w, x.h)));
             let glued = match sh.kind {
@@ -498,10 +503,17 @@ fn overlays(app: &mut SlideApp, ui: &Ui, painter: &egui::Painter, xf: Xf, t: &To
         let tr = deckcraft_render::shape_geometry(sh, x.w, x.h).text_rect;
         let m = deckcraft_render::text_transform(x.affine(), tr, l.rotation);
         let (s0, s1) = ts.ordered();
+        let mut lines: Vec<Rect> = vec![];
         for r in l.selection_rects(deckcraft_text::Pos { para: s0.0, ch: s0.1 }, deckcraft_text::Pos { para: s1.0, ch: s1.1 }) {
             let pts = [Point::new(r.x0, r.y0), Point::new(r.x1, r.y0), Point::new(r.x1, r.y1), Point::new(r.x0, r.y1)].map(|q| xf.to_screen(m * q));
+            lines.push(pts.iter().fold(Rect::NOTHING, |b, p| b.union(Rect::from_min_max(*p, *p))));
             painter.add(egui::Shape::convex_polygon(pts.to_vec(), t.text_selection, Stroke::NONE));
         }
+        text_anchor = match (ts.is_range(), lines.first(), lines.last()) {
+            (true, Some(first), Some(last)) => Some(crate::ask_agent::Anchor::Text { first: *first, last: *last }),
+            _ => deckcraft_engine::cmd::text::caret_line(st, ts)
+                .map(|(top, bot)| crate::ask_agent::Anchor::Caret(Rect::from_two_pos(xf.to_screen(top), xf.to_screen(bot)))),
+        };
         // An input method's composition: underlined in place, thicker under the part being converted.
         for (a, b, thick) in deckcraft_engine::cmd::text::composition_underlines(st) {
             painter.line_segment([xf.to_screen(a), xf.to_screen(b)], Stroke::new(if thick { 2.0 } else { 1.0 }, t.caret));
@@ -586,6 +598,13 @@ fn overlays(app: &mut SlideApp, ui: &Ui, painter: &egui::Painter, xf: Xf, t: &To
         let c = if mode == "highlighter" { c.gamma_multiply(0.45) } else { c };
         painter.add(egui::Shape::line(pts, Stroke::new((*width as f32 * xf.scale).max(1.0), c)));
     }
+    // Text being edited anchors on the text (a caret or a table cell takes no chip); otherwise the
+    // selected shapes do.
+    app.ask_agent.anchor = match &editing {
+        Some(ts) if !ts.notes => text_anchor.or(shapes_box.filter(|_| ts.cell.is_some()).map(crate::ask_agent::Anchor::Caret)),
+        Some(_) => None,
+        None => shapes_box.filter(|b| b.is_finite()).map(crate::ask_agent::Anchor::Shapes),
+    };
 }
 
 fn rotate_handle(p: &egui::Painter, c: Pos2, t: &Tokens) {
@@ -692,6 +711,14 @@ fn context_menu(app: &mut SlideApp, resp: &egui::Response) {
             }
             if ui.button("New Comment").clicked() {
                 app.dialog = Some(crate::dialogs::Dialog::new("comment"));
+                ui.close();
+            }
+        }
+        // Ask Agent: when the control channel is on (it says how to connect an agent otherwise).
+        if app.ask_agent.hub.is_some() {
+            ui.separator();
+            if ui.button("Ask Agent…").clicked() {
+                let _ = app.run(crate::ask_agent::COMMAND, json!({}));
                 ui.close();
             }
         }

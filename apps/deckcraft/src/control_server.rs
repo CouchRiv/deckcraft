@@ -5,6 +5,10 @@
 //! the token from `deckcraft_mcp::auth` (published to `auth::token_path(port)`); anything else,
 //! including a line that isn't JSON (an HTTP request from a web page), gets an error reply and
 //! closes the connection.
+//!
+//! Ask Agent's `agent.listen` and `agent.reply` are answered here, after that check, on the
+//! connection's own thread, from the window's [`AgentHub`]: an agent waiting for the next request
+//! never holds up the window or other connections.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -13,25 +17,28 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use deckcraft_mcp::auth;
-use deckcraft_ui_egui::ControlRequest;
+use deckcraft_ui_egui::ask_agent::{DEFAULT_LISTEN_MS, MAX_LISTEN_MS};
+use deckcraft_ui_egui::{AgentHub, ControlRequest};
 use serde_json::{Value, json};
 
 const AUTH_FIRST: &str = "authenticate first: {\"method\":\"auth\",\"params\":{\"token\":…}}";
 
-pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
-    let (tx, rx) = channel::<ControlRequest>();
+/// Start the control server on `port`; `None` when it can't (no token, port taken, token file
+/// not written): the control channel, and with it Ask Agent, is then off. `agents` is the
+/// window's Ask Agent queue.
+pub fn start(port: u16, ctx: egui::Context, agents: AgentHub) -> Option<Receiver<ControlRequest>> {
     let token = match auth::env_token().map_or_else(auth::new_token, Ok) {
         Ok(t) => t,
         Err(e) => {
             log::error!("control server: no token: {e}");
-            return rx;
+            return None;
         }
     };
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
             log::error!("control server failed to bind 127.0.0.1:{port}: {e}");
-            return rx;
+            return None;
         }
     };
     // The port actually bound (`--control 0` picks a free one).
@@ -40,20 +47,73 @@ pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
         Ok(path) => path,
         Err(e) => {
             log::error!("control server: writing the token file: {e}");
-            return rx;
+            return None;
         }
     };
     log::info!("control server listening on 127.0.0.1:{port} (token in {})", token_file.display());
+    agents.set_port(port);
+    Some(serve_on(listener, token, ctx, agents))
+}
+
+fn serve_on(listener: TcpListener, token: String, ctx: egui::Context, agents: AgentHub) -> Receiver<ControlRequest> {
+    let (tx, rx) = channel::<ControlRequest>();
     let token = Arc::new(token);
     std::thread::spawn(move || {
+        // Each connection's number, for Ask Agent's presence.
+        let mut conn = 0u64;
         for stream in listener.incoming().flatten() {
-            let tx = tx.clone();
-            let ctx = ctx.clone();
-            let token = Arc::clone(&token);
-            std::thread::spawn(move || serve(stream, &token, tx, ctx));
+            conn = conn.wrapping_add(1);
+            let (tx, ctx, token, agents) = (tx.clone(), ctx.clone(), Arc::clone(&token), agents.clone());
+            std::thread::spawn(move || serve(stream, &token, tx, ctx, &agents, conn));
         }
     });
     rx
+}
+
+/// Whether the client is still there (it hasn't closed its end of the connection): asked while
+/// `agent.listen` waits and before it hands a request out, so a request never goes to a client
+/// that has gone.
+fn peer_open(s: &TcpStream) -> bool {
+    if s.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let mut b = [0u8; 1];
+    let r = s.peek(&mut b);
+    let _ = s.set_nonblocking(false);
+    match r {
+        Ok(0) => false,
+        Ok(_) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
+    }
+}
+
+/// `agent.listen {timeoutMs?}` and `agent.reply {id, text, done?}` (Ask Agent) for connection
+/// `conn`: the reply, and the request handed out (to put back if the reply can't be written).
+fn agent_method(agents: &AgentHub, conn: u64, method: &str, p: &Value, probe: &TcpStream) -> (Value, Option<u64>) {
+    let err = |e: &str| json!({"ok": false, "error": e});
+    if method == "agent.listen" {
+        if agents.working_for(conn).is_some() {
+            return (err("finish the current Ask Agent request before listening again"), None);
+        }
+        let ms = match p.get("timeoutMs") {
+            None | Some(Value::Null) => DEFAULT_LISTEN_MS,
+            Some(v) => match v.as_f64().filter(|ms| ms.is_finite() && *ms >= 0.0) {
+                Some(ms) => (ms as u64).min(MAX_LISTEN_MS),
+                None => return (err("`timeoutMs` is a number of milliseconds (at most 60000)"), None),
+            },
+        };
+        return match agents.listen(conn, Duration::from_millis(ms), || peer_open(probe)) {
+            Some(r) => (json!({"ok": true, "result": r.to_json()}), Some(r.id)),
+            None => (json!({"ok": true, "result": {"none": true}}), None),
+        };
+    }
+    let Some(id) = p.get("id").and_then(Value::as_u64) else { return (err("missing `id` (the request's id from agent.listen)"), None) };
+    let Some(text) = p.get("text").and_then(Value::as_str) else { return (err("missing `text` (what to show in the window)"), None) };
+    let done = p.get("done").and_then(Value::as_bool).unwrap_or(true);
+    match agents.reply(conn, id, text, done) {
+        Ok(v) => (json!({"ok": true, "result": v}), None),
+        Err(e) => (err(&e), None),
+    }
 }
 
 /// The reply to a request line that arrives before the connection has authenticated, and whether
@@ -72,8 +132,9 @@ fn authenticate(line: &str, token: &str) -> (Value, bool) {
     }
 }
 
-fn serve(stream: TcpStream, token: &str, tx: Sender<ControlRequest>, ctx: egui::Context) {
+fn serve(stream: TcpStream, token: &str, tx: Sender<ControlRequest>, ctx: egui::Context, agents: &AgentHub, conn: u64) {
     let Ok(read) = stream.try_clone() else { return };
+    let Ok(probe) = stream.try_clone() else { return };
     let mut out = stream;
     let mut authenticated = false;
     for line in BufReader::new(read).lines() {
@@ -100,7 +161,58 @@ fn serve(stream: TcpStream, token: &str, tx: Sender<ControlRequest>, ctx: egui::
                     }
                     continue;
                 }
-                let params = msg.get("params").cloned().unwrap_or(json!({}));
+                let mut params = msg.get("params").cloned().unwrap_or(json!({}));
+                // Ask Agent: answered here, never on the UI thread.
+                if method == "agent.listen" || method == "agent.reply" {
+                    let (mut r, taken) = agent_method(agents, conn, &method, &params, &probe);
+                    if let Some(o) = r.as_object_mut() {
+                        o.insert("id".into(), id);
+                    }
+                    if writeln!(out, "{r}").is_err() {
+                        // The agent never got it: back in the queue for the next one.
+                        if let Some(t) = taken {
+                            agents.requeue(t);
+                        }
+                        break;
+                    }
+                    continue;
+                }
+                if let Some(request) = agents.working_for(conn) {
+                    let why = if method == "engine.execute" {
+                        if !params.is_object() {
+                            Some("engine.execute params must be an object")
+                        } else if params.get("request").and_then(Value::as_u64).is_some_and(|id| id != request) {
+                            Some("command belongs to another Ask Agent request")
+                        } else {
+                            params["request"] = json!(request);
+                            None
+                        }
+                    } else if matches!(method.as_str(), "engine.commands" | "document.inspect" | "ui.inspect" | "ui.render" | "ui.screenshot") {
+                        None
+                    } else {
+                        Some("while handling Ask Agent, edit through engine.execute so one Undo covers the request")
+                    };
+                    if let Some(why) = why {
+                        if writeln!(out, "{}", json!({"id": id, "ok": false, "error": why})).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                if let Some(request) = params.get("request")
+                    && !request.as_u64().is_some_and(|r| agents.owns(conn, r))
+                {
+                    if writeln!(
+                        out,
+                        "{}",
+                        json!({"id": id, "ok": false, "error": "listen for this Ask Agent request on this connection before editing"})
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
                 let (req, rrx) = ControlRequest::new(method, params);
                 if tx.send(req).is_err() {
                     break;
@@ -118,6 +230,9 @@ fn serve(stream: TcpStream, token: &str, tx: Sender<ControlRequest>, ctx: egui::
             break;
         }
     }
+    // Gone: it no longer counts as an agent, and a request it took without answering goes back in
+    // the queue.
+    agents.disconnect(conn);
 }
 
 #[cfg(test)]
@@ -162,7 +277,7 @@ mod tests {
         let (tx, rx) = channel();
         let server = std::thread::spawn(move || {
             for stream in listener.incoming().take(2) {
-                serve(stream.unwrap(), TOKEN, tx.clone(), egui::Context::default());
+                serve(stream.unwrap(), TOKEN, tx.clone(), egui::Context::default(), &AgentHub::new(0, None), 1);
             }
         });
 
@@ -191,5 +306,188 @@ mod tests {
         assert!(line.contains("\"id\":2"), "{line}");
         drop((w, r));
         server.join().unwrap();
+    }
+
+    // Ask Agent.
+
+    use deckcraft_ui_egui::ask_agent::State;
+    use std::time::Instant;
+
+    /// A server on a free port with its Ask Agent queue.
+    fn boot() -> (u16, Receiver<ControlRequest>, AgentHub) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let agents = AgentHub::new(port, None);
+        (port, serve_on(listener, TOKEN.to_string(), egui::Context::default(), agents.clone()), agents)
+    }
+
+    /// A client connection: one line out, one line back.
+    struct Conn(BufReader<TcpStream>, TcpStream);
+
+    impl Conn {
+        fn open(port: u16) -> Self {
+            let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            Conn(BufReader::new(s.try_clone().unwrap()), s)
+        }
+        fn authed(port: u16) -> Self {
+            let mut c = Self::open(port);
+            assert_eq!(c.call(&json!({"id": 0, "method": "auth", "params": {"token": TOKEN}}))["ok"], true);
+            c
+        }
+        fn send(&mut self, v: &Value) {
+            writeln!(self.1, "{v}").unwrap();
+        }
+        fn recv(&mut self) -> Value {
+            let mut line = String::new();
+            self.0.read_line(&mut line).unwrap();
+            serde_json::from_str(&line).unwrap_or(Value::Null)
+        }
+        fn call(&mut self, v: &Value) -> Value {
+            self.send(v);
+            self.recv()
+        }
+        fn closed(&mut self) -> bool {
+            let mut line = String::new();
+            matches!(self.0.read_line(&mut line), Ok(0) | Err(_))
+        }
+    }
+
+    fn shapes_sel() -> Value {
+        json!({"kind": "shapes", "slide": {"index": 0, "id": 256, "title": "Kilns"}, "shapes": [{"id": 258, "kind": "shape", "text": "Kilns fire clay."}]})
+    }
+
+    fn until(f: impl Fn() -> bool) {
+        let t0 = Instant::now();
+        while !f() && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn agent_listen_hands_out_the_next_request_without_the_window() {
+        let (port, rx, agents) = boot();
+        let id = agents.ask("tighten the wording", shapes_sel(), json!({"title": "Kilns.pptx", "slides": 3})).unwrap();
+        let mut c = Conn::authed(port);
+        let r = c.call(&json!({"id": 1, "method": "agent.listen", "params": {"timeoutMs": 1000}}));
+        assert_eq!((r["ok"].clone(), r["id"].clone()), (json!(true), json!(1)), "{r}");
+        assert_eq!(r["result"]["id"], id);
+        assert_eq!(r["result"]["instruction"], "tighten the wording");
+        assert_eq!(r["result"]["selection"]["shapes"][0]["id"], 258);
+        assert_eq!(r["result"]["document"]["title"], "Kilns.pptx");
+        assert!(rx.try_recv().is_err(), "agent.listen never reaches the UI thread");
+        // Finish the one outstanding request, then `none` after the timeout.
+        assert_eq!(c.call(&json!({"id": 9, "method": "agent.reply", "params": {"id": id, "text": "Done"}}))["ok"], true);
+        let t0 = Instant::now();
+        assert_eq!(c.call(&json!({"id": 2, "method": "agent.listen", "params": {"timeoutMs": 50}}))["result"], json!({"none": true}));
+        assert!(t0.elapsed() < Duration::from_secs(3));
+        // Junk timeouts are refused, not turned into a long wait.
+        for bad in [json!("soon"), json!(-5), json!(true)] {
+            let r = c.call(&json!({"id": 3, "method": "agent.listen", "params": {"timeoutMs": bad}}));
+            assert_eq!(r["ok"], false, "{bad}: {r}");
+        }
+    }
+
+    #[test]
+    fn a_waiting_agent_is_woken_by_a_request_and_does_not_hold_up_the_window() {
+        let (port, rx, agents) = boot();
+        let mut listener = Conn::authed(port);
+        listener.send(&json!({"id": 1, "method": "agent.listen", "params": {"timeoutMs": 20000}}));
+        until(|| agents.agent_present());
+        assert!(agents.agent_present(), "the window sees a listening agent");
+        // While it waits another connection is answered.
+        let mut other = Conn::authed(port);
+        other.send(&json!({"id": 2, "method": "document.inspect"}));
+        let req = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let _ = req.reply.send(json!({"ok": true, "result": {}}));
+        assert_eq!(other.recv()["ok"], true, "the window still answers while an agent waits");
+        let t0 = Instant::now();
+        let id = agents.ask("make this slide punchier", shapes_sel(), json!({})).unwrap();
+        assert_eq!(listener.recv()["result"]["id"], id);
+        assert!(t0.elapsed() < Duration::from_secs(2), "woken by the request, not by the timeout");
+    }
+
+    #[test]
+    fn agent_reply_shows_in_the_window_and_reports_cancelled_requests() {
+        let (port, _rx, agents) = boot();
+        let id = agents.ask("explain this chart", shapes_sel(), json!({})).unwrap();
+        let mut c = Conn::authed(port);
+        c.call(&json!({"id": 1, "method": "agent.listen", "params": {"timeoutMs": 1000}}));
+        let r = c.call(&json!({"id": 2, "method": "agent.reply", "params": {"id": id, "text": "Reading the chart…", "done": false}}));
+        assert_eq!(r["result"]["done"], false, "{r}");
+        let r = c.call(&json!({"id": 3, "method": "agent.reply", "params": {"id": id, "text": "Sales doubled in Q3."}}));
+        assert_eq!(r["result"]["shown"], true, "{r}");
+        let req = agents.request(id).unwrap();
+        assert_eq!((req.state, req.reply.as_str()), (State::Answered, "Sales doubled in Q3."));
+        // Errors the agent can act on.
+        let e = |c: &mut Conn, p: Value| c.call(&json!({"id": 4, "method": "agent.reply", "params": p}))["error"].as_str().unwrap_or("").to_string();
+        assert!(e(&mut c, json!({"text": "x"})).contains("missing `id`"));
+        assert!(e(&mut c, json!({"id": id})).contains("missing `text`"));
+        assert!(e(&mut c, json!({"id": 424242, "text": "x"})).contains("no Ask Agent request"));
+        // The person cancelled: the agent is told, so it can stop.
+        let id = agents.ask("add speaker notes", shapes_sel(), json!({})).unwrap();
+        c.call(&json!({"id": 5, "method": "agent.listen", "params": {"timeoutMs": 1000}}));
+        agents.cancel(id);
+        let r = c.call(&json!({"id": 6, "method": "agent.reply", "params": {"id": id, "text": "Done"}}));
+        assert_eq!(r["result"]["cancelled"], true, "{r}");
+    }
+
+    #[test]
+    fn agent_methods_need_the_token() {
+        let (port, _rx, agents) = boot();
+        let id = agents.ask("summarize", shapes_sel(), json!({})).unwrap();
+        for line in [
+            json!({"id": 1, "method": "agent.listen", "params": {"timeoutMs": 10}}),
+            json!({"id": 1, "method": "agent.reply", "params": {"id": id, "text": "x"}}),
+        ] {
+            let mut c = Conn::open(port);
+            assert!(c.call(&line)["error"].as_str().unwrap_or("").contains("authenticate first"), "{line}");
+            assert!(c.closed(), "{line}");
+        }
+        assert_eq!(agents.request(id).unwrap().state, State::Waiting, "nothing was handed out or answered");
+        assert!(!agents.agent_present(), "an unauthenticated client doesn't count as an agent");
+    }
+
+    /// A client that hangs up stops counting at once, gets no request, and a request it took
+    /// without answering goes back in the queue.
+    #[test]
+    fn a_client_that_hung_up_stops_counting_and_gives_back_its_request() {
+        let (port, _rx, agents) = boot();
+        let mut gone = Conn::authed(port);
+        gone.send(&json!({"id": 1, "method": "agent.listen", "params": {"timeoutMs": 20000}}));
+        until(|| agents.agent_present());
+        let _ = gone.1.shutdown(std::net::Shutdown::Both);
+        drop(gone);
+        until(|| !agents.agent_present());
+        assert!(!agents.agent_present(), "a client that left while listening no longer counts");
+        let id = agents.ask("fix the typos", shapes_sel(), json!({})).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(agents.request(id).unwrap().state, State::Waiting, "kept for the next agent");
+        // An agent takes it, then its connection closes before it answers.
+        let mut taker = Conn::authed(port);
+        assert_eq!(taker.call(&json!({"id": 1, "method": "agent.listen", "params": {"timeoutMs": 1000}}))["result"]["id"], id);
+        assert_eq!(agents.request(id).unwrap().state, State::Working);
+        assert!(agents.agent_present(), "it holds a request on an open connection");
+        drop(taker);
+        until(|| agents.request(id).is_some_and(|r| r.state == State::Waiting));
+        assert_eq!(agents.request(id).unwrap().state, State::Waiting, "back in the queue");
+        assert!(!agents.agent_present());
+        let mut next = Conn::authed(port);
+        assert_eq!(next.call(&json!({"id": 1, "method": "agent.listen", "params": {"timeoutMs": 1000}}))["result"]["id"], id);
+    }
+
+    #[test]
+    fn raw_agent_commands_are_attributed_and_cannot_bypass_undo() {
+        let (port, rx, agents) = boot();
+        let id = agents.ask("move", shapes_sel(), json!({})).unwrap();
+        let mut c = Conn::authed(port);
+        assert_eq!(c.call(&json!({"id": 1, "method": "agent.listen", "params": {"timeoutMs": 1}}))["result"]["id"], id);
+        assert_eq!(c.call(&json!({"id": 2, "method": "agent.listen", "params": {"timeoutMs": 1}}))["ok"], false);
+        assert_eq!(c.call(&json!({"id": 3, "method": "ui.text", "params": {"text": "bypass"}}))["ok"], false);
+        c.send(&json!({"id": 4, "method": "engine.execute", "params": {"command": "shape.move", "params": {"dx": 10}}}));
+        let request = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(request.params["request"], id);
+        request.reply.send(json!({"ok": true, "result": {}})).unwrap();
+        assert_eq!(c.recv()["ok"], true);
     }
 }

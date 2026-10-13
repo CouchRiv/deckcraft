@@ -14,6 +14,8 @@
 //! - `ui.resize {width, height}`, `ui.focus`
 //! - `show.start {from?}`, `show.key {key}`, `show.end`
 //! - `app.open {path}` / `app.save {path?}` / `app.export {path, …}` / `app.quit`
+//! - `agent.listen` / `agent.reply` (Ask Agent) are answered by the host's control server on the
+//!   connection's own thread, from [`crate::AgentHub`]; they never come here.
 
 use std::sync::mpsc::Sender;
 
@@ -78,6 +80,7 @@ pub fn inspect(app: &SlideApp, ctx: &egui::Context) -> Value {
         "documents": app.session.documents().iter().map(|d| json!({"title": d.title(), "dirty": d.is_dirty(), "path": d.path})).collect::<Vec<_>>(),
         "status": app.status.as_ref().map(|s| s.0.clone()),
         "perf": {"frameMs": app.perf.frame_ms, "renderMs": app.perf.render_ms, "fps": app.perf.fps},
+        "askAgent": app.ask_agent.inspect(),
     })
 }
 
@@ -108,7 +111,12 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
         "engine.execute" | "ui.menu.invoke" | "command" => {
             let Some(id) = s("command").or(s("id")) else { return err("missing `command`") };
             let params = p.get("params").cloned().filter(|v| !v.is_null()).unwrap_or(json!({}));
-            wrap(app.run(id, params))
+            if let Some(request) = p.get("request") {
+                let Some(request) = request.as_u64() else { return err("request must be an Ask Agent id") };
+                wrap(crate::ask_agent::run_for(app, request, id, params))
+            } else {
+                wrap(app.run(id, params))
+            }
         }
         "engine.commands" => ok(all_commands(app)),
         "document.inspect" => wrap(app.run("document.inspect", json!({}))),

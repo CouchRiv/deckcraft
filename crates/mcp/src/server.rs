@@ -24,7 +24,9 @@ list_commands and run them with run_command (or several with batch). Typical flo
 {layout:\"titleAndContent\", title, body} → add_shape / add_text_box / insert_picture / insert_chart → \
 inspect_slide to read back ids, boxes and text → render_slide to look at the result. Shapes are selected with \
 run_command edit.select {ids:[…]}; formatting commands (format.*, shape.fill, shape.line…) act on the selection or \
-on `ids`. Save with save_presentation (.deckcraft or .pptx).";
+on `ids`. Save with save_presentation (.deckcraft or .pptx). Ask Agent: when connected to the app, wait_for_request \
+returns what the person asks from the DeckCraft window (an instruction about the shapes, text or slide they selected); \
+send a short progress note with reply_to_request (done: false) at once, do it, then answer with reply_to_request.";
 
 /// Resource URIs.
 pub const DOC_URI: &str = "deckcraft://document";
@@ -34,6 +36,52 @@ pub const COMMANDS_URI: &str = "deckcraft://commands";
 pub struct Server {
     backend: Box<dyn Backend>,
     initialized: bool,
+}
+
+/// Attach every command to the request this MCP connection took, until its final reply.
+/// One outstanding request avoids ambiguously attributing edits to an older request.
+struct RequestBackend {
+    inner: Box<dyn Backend>,
+    request: Option<u64>,
+}
+
+impl Backend for RequestBackend {
+    fn call(&mut self, method: &str, mut params: Value) -> Result<Value, String> {
+        if method == "agent.listen" && self.request.is_some() {
+            return Err("finish the current Ask Agent request with reply_to_request before waiting again".into());
+        }
+        if let Some(id) = self.request {
+            if method == "engine.execute" {
+                if !params.is_object() {
+                    return Err("engine.execute params must be an object".into());
+                }
+                if params.get("request").and_then(Value::as_u64).is_some_and(|r| r != id) {
+                    return Err("command belongs to another Ask Agent request".into());
+                }
+                params["request"] = json!(id);
+            } else if !matches!(method, "agent.reply" | "engine.commands" | "document.inspect" | "ui.inspect" | "ui.render" | "ui.screenshot") {
+                return Err("while handling Ask Agent, edit through engine.execute so one Undo covers the request".into());
+            }
+            if method == "agent.reply" && params.get("id").and_then(Value::as_u64) != Some(id) {
+                return Err("reply belongs to another Ask Agent request".into());
+            }
+        }
+        let result = self.inner.call(method, params.clone())?;
+        if method == "agent.listen" {
+            self.request = result.get("id").and_then(Value::as_u64);
+        } else if method == "agent.reply"
+            && (result.get("cancelled").and_then(Value::as_bool) == Some(true) || params.get("done").and_then(Value::as_bool).unwrap_or(true))
+        {
+            self.request = None;
+        }
+        Ok(result)
+    }
+    fn has_ui(&self) -> bool {
+        self.inner.has_ui()
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
 }
 
 fn response(id: Value, result: Value) -> Value {
@@ -46,7 +94,7 @@ fn error(id: Value, code: i64, message: impl Into<String>) -> Value {
 
 impl Server {
     pub fn new(backend: Box<dyn Backend>) -> Self {
-        Self { backend, initialized: false }
+        Self { backend: Box::new(RequestBackend { inner: backend, request: None }), initialized: false }
     }
 
     pub fn backend(&mut self) -> &mut dyn Backend {

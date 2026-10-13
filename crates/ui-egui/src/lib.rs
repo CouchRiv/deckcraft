@@ -6,6 +6,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod ask_agent;
 pub mod canvas;
 pub mod control;
 pub mod credits;
@@ -33,6 +34,7 @@ use deckcraft_engine::{Mods, Session, UiRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub use ask_agent::AgentHub;
 pub use control::{ControlRequest, ControlResponse};
 
 pub type ReadFn = Box<dyn Fn(&str) -> Result<Vec<u8>, String>>;
@@ -165,6 +167,12 @@ pub const UI_COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
     ("app.exportDialog", "Export…", None, "{}"),
     ("app.dialog", "Open Dialog", None, "{id}"),
     ("app.links", "Community Links", None, "{}"),
+    (
+        ask_agent::COMMAND,
+        "Ask Agent…",
+        Some(ask_agent::SHORTCUT),
+        "{instruction?: text (send without the bubble), scope?: slide|deck, cancel?: request id, close?: bool}",
+    ),
 ];
 
 pub struct Perf {
@@ -222,6 +230,8 @@ pub struct SlideApp {
     pub(crate) thumb_drag: Option<(usize, usize)>,
     /// Selection pane: folded groups, renaming, drag and drop.
     pub selpane: selpane::State,
+    /// Ask Agent: the queue shared with the control channel, the chip and the bubble.
+    pub ask_agent: ask_agent::AskAgent,
 }
 
 impl SlideApp {
@@ -262,11 +272,18 @@ impl SlideApp {
             ui_fonts: uifonts::UiFonts::default(),
             thumb_drag: None,
             selpane: selpane::State::default(),
+            ask_agent: ask_agent::AskAgent::default(),
         }
     }
 
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
         self.control_rx = Some(rx);
+        self
+    }
+
+    /// Ask Agent's queue, shared with the control channel's connections.
+    pub fn with_agent_hub(mut self, hub: AgentHub) -> Self {
+        self.ask_agent.hub = Some(hub);
         self
     }
 
@@ -374,6 +391,7 @@ impl SlideApp {
                 let d = p.get("id").and_then(Value::as_str).ok_or("missing `id`")?;
                 self.dialog = Some(dialogs::Dialog::new(d));
             }
+            ask_agent::COMMAND => return ask_agent::command(self, p),
             "app.links" => {
                 use deckcraft_engine::links::*;
                 return Ok(json!({"discord": DISCORD, "website": WEBSITE, "apps": APPS, "appPage": APP_PAGE, "github": GITHUB}));
@@ -694,6 +712,7 @@ impl SlideApp {
             self.drain_requests();
             return;
         }
+        ask_agent::typed_on_slide(self, &events);
         for e in events {
             match e {
                 egui::Event::Text(t) => {
@@ -766,6 +785,9 @@ impl SlideApp {
         if self.home.is_some_and(|k| k != self.docs_key()) {
             self.home = None;
         }
+        // The canvas sets it again if it draws a selection this frame.
+        self.ask_agent.anchor = None;
+        ask_agent::keyboard(self, &ctx);
         self.keyboard(&ctx);
         ribbon::title_bar(self, ui);
         if self.session.active().is_some() && !self.home_open() {
@@ -798,10 +820,12 @@ impl SlideApp {
                 }
             }
         });
+        ask_agent::show(self, &ctx);
         toast::note_missing_fonts(self);
         toast::show(self, &ctx);
         dialogs::show(self, &ctx);
         menus::palette(self, &ctx);
+        ask_agent::remember_focus(self, &ctx);
         for url in std::mem::take(&mut self.pending_urls) {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
