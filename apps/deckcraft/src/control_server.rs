@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use deckcraft_mcp::auth;
 use deckcraft_ui_egui::ask_agent::{DEFAULT_LISTEN_MS, MAX_LISTEN_MS};
@@ -87,6 +87,26 @@ fn peer_open(s: &TcpStream) -> bool {
     }
 }
 
+/// While an engine command waits for the UI, disconnects still release ownership promptly.
+fn wait_for_ui(rx: &Receiver<Value>, probe: &TcpStream) -> Option<Value> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if !peer_open(probe) {
+            return None;
+        }
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return Some(json!({"ok": false, "error": "timeout"}));
+        };
+        match rx.recv_timeout(left.min(Duration::from_millis(250))) {
+            Ok(reply) => return Some(reply),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Some(json!({"ok": false, "error": "control channel closed"}));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
 /// `agent.listen {timeoutMs?}` and `agent.reply {id, text, done?}` (Ask Agent) for connection
 /// `conn`: the reply, and the request handed out (to put back if the reply can't be written).
 fn agent_method(agents: &AgentHub, conn: u64, method: &str, p: &Value, probe: &TcpStream) -> (Value, Option<u64>) {
@@ -99,7 +119,9 @@ fn agent_method(agents: &AgentHub, conn: u64, method: &str, p: &Value, probe: &T
             None | Some(Value::Null) => DEFAULT_LISTEN_MS,
             Some(v) => match v.as_f64().filter(|ms| ms.is_finite() && *ms >= 0.0) {
                 Some(ms) => (ms as u64).min(MAX_LISTEN_MS),
-                None => return (err("`timeoutMs` is a number of milliseconds (at most 60000)"), None),
+                None => {
+                    return (err("`timeoutMs` is a number of milliseconds (at most 60000)"), None);
+                }
             },
         };
         return match agents.listen(conn, Duration::from_millis(ms), || peer_open(probe)) {
@@ -107,8 +129,12 @@ fn agent_method(agents: &AgentHub, conn: u64, method: &str, p: &Value, probe: &T
             None => (json!({"ok": true, "result": {"none": true}}), None),
         };
     }
-    let Some(id) = p.get("id").and_then(Value::as_u64) else { return (err("missing `id` (the request's id from agent.listen)"), None) };
-    let Some(text) = p.get("text").and_then(Value::as_str) else { return (err("missing `text` (what to show in the window)"), None) };
+    let Some(id) = p.get("id").and_then(Value::as_u64) else {
+        return (err("missing `id` (the request's id from agent.listen)"), None);
+    };
+    let Some(text) = p.get("text").and_then(Value::as_str) else {
+        return (err("missing `text` (what to show in the window)"), None);
+    };
     let done = p.get("done").and_then(Value::as_bool).unwrap_or(true);
     match agents.reply(conn, id, text, done) {
         Ok(v) => (json!({"ok": true, "result": v}), None),
@@ -134,7 +160,9 @@ fn authenticate(line: &str, token: &str) -> (Value, bool) {
 
 fn serve(stream: TcpStream, token: &str, tx: Sender<ControlRequest>, ctx: egui::Context, agents: &AgentHub, conn: u64) {
     let Ok(read) = stream.try_clone() else { return };
-    let Ok(probe) = stream.try_clone() else { return };
+    let Ok(probe) = stream.try_clone() else {
+        return;
+    };
     let mut out = stream;
     let mut authenticated = false;
     for line in BufReader::new(read).lines() {
@@ -213,12 +241,16 @@ fn serve(stream: TcpStream, token: &str, tx: Sender<ControlRequest>, ctx: egui::
                     }
                     continue;
                 }
-                let (req, rrx) = ControlRequest::new(method, params);
+                let agent_connection = params.get("request").is_some().then_some(conn);
+                let (mut req, rrx) = ControlRequest::new(method, params);
+                req.agent_connection = agent_connection;
                 if tx.send(req).is_err() {
                     break;
                 }
                 ctx.request_repaint();
-                let mut r = rrx.recv_timeout(Duration::from_secs(60)).unwrap_or_else(|_| json!({"ok": false, "error": "timeout"}));
+                let Some(mut r) = wait_for_ui(&rrx, &probe) else {
+                    break;
+                };
                 if let Some(o) = r.as_object_mut() {
                     o.insert("id".into(), id);
                 }
@@ -489,5 +521,30 @@ mod tests {
         assert_eq!(request.params["request"], id);
         request.reply.send(json!({"ok": true, "result": {}})).unwrap();
         assert_eq!(c.recv()["ok"], true);
+    }
+
+    #[test]
+    fn disconnect_while_waiting_for_ui_requeues_and_stale_command_is_refused() {
+        let (port, rx, agents) = boot();
+        let mut app = deckcraft_ui_egui::SlideApp::new(deckcraft_engine::Session::with_new(), deckcraft_ui_egui::Services::default())
+            .with_agent_hub(agents.clone());
+        let id = app.run("app.askAgent", json!({"instruction": "move"})).unwrap()["id"].as_u64().unwrap();
+        let mut c = Conn::authed(port);
+        c.call(&json!({"id": 1, "method": "agent.listen", "params": {"timeoutMs": 1}}));
+        c.send(&json!({"id": 2, "method": "engine.execute", "params": {"command": "slide.new", "params": {}}}));
+        let stale = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(stale.agent_connection.is_some());
+        drop(c);
+        until(|| !agents.agent_present());
+        assert!(!agents.agent_present(), "disconnect is detected while waiting for the UI, not after 60 seconds");
+        assert_eq!(agents.request(id).unwrap().state, State::Waiting);
+        let mut next = Conn::authed(port);
+        assert_eq!(next.call(&json!({"id": 3, "method": "agent.listen", "params": {"timeoutMs": 1}}))["result"]["id"], id);
+        let before = app.session.active().unwrap().doc.clone();
+        match deckcraft_ui_egui::control::handle(&mut app, &egui::Context::default(), &stale) {
+            deckcraft_ui_egui::control::Outcome::Done(reply) => assert_eq!(reply["ok"], false),
+            _ => panic!("unexpected screenshot"),
+        }
+        assert_eq!(app.session.active().unwrap().doc, before, "a queued command from the lost owner cannot run");
     }
 }

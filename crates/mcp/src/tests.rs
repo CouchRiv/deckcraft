@@ -204,3 +204,60 @@ fn ask_agent_bridge_attributes_commands_and_releases_after_reply() {
     s.backend().call("engine.execute", json!({"command": "shape.move", "params": {"dx": 5}})).ok();
     assert!(calls.lock().unwrap().last().unwrap().1.get("request").is_none());
 }
+
+struct ReconnectedAgent {
+    refusal: &'static str,
+    listens: usize,
+    exchanges: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+}
+impl crate::Backend for ReconnectedAgent {
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.exchanges.lock().unwrap().push((method.into(), params));
+        match method {
+            "agent.listen" => {
+                self.listens += 1;
+                Ok(if self.listens == 2 { json!({"none": true}) } else { json!({"id": 7}) })
+            }
+            "engine.execute" if self.listens == 1 => Err(self.refusal.into()),
+            "engine.execute" => Ok(json!({})),
+            "agent.reply" if self.listens == 1 && self.refusal.starts_with("no Ask Agent request ") => Err(self.refusal.into()),
+            "agent.reply" => Ok(json!({"shown": true, "done": true})),
+            _ => Err("unexpected method".into()),
+        }
+    }
+    fn has_ui(&self) -> bool {
+        true
+    }
+    fn describe(&self) -> String {
+        "synthetic reconnect".into()
+    }
+}
+
+#[test]
+fn ask_agent_reconnect_releases_stale_ownership_but_blocks_untagged_edits() {
+    for refusal in [
+        "listen for this Ask Agent request on this connection before editing",
+        "DeckCraft app at synthetic is not reachable: disconnected",
+        "no Ask Agent request 7: it was never made, or the person dismissed it",
+    ] {
+        let exchanges = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut s = Server::new(Box::new(ReconnectedAgent { refusal, listens: 0, exchanges: exchanges.clone() }));
+        tool(&mut s, "wait_for_request", json!({}));
+        let edit = json!({"command": "shape.move", "params": {"dx": 5}});
+        let lost = if refusal.starts_with("no Ask Agent request ") {
+            s.backend().call("agent.reply", json!({"id": 7, "text": "Done", "done": true}))
+        } else {
+            s.backend().call("engine.execute", edit.clone())
+        };
+        assert!(lost.unwrap_err().contains("reacquire"));
+        let count = exchanges.lock().unwrap().len();
+        assert!(s.backend().call("engine.execute", edit.clone()).is_err());
+        assert_eq!(exchanges.lock().unwrap().len(), count, "no untagged edit reaches the app after reconnect");
+        assert_eq!(tool(&mut s, "wait_for_request", json!({})), json!({"none": true}));
+        assert!(s.backend().call("engine.execute", edit.clone()).is_err(), "a timeout still has no ownership");
+        tool(&mut s, "wait_for_request", json!({}));
+        s.backend().call("engine.execute", edit).unwrap();
+        assert_eq!(exchanges.lock().unwrap().last().unwrap().1["request"], 7);
+        tool(&mut s, "reply_to_request", json!({"id": 7, "text": "Done"}));
+    }
+}

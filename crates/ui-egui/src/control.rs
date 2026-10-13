@@ -30,12 +30,14 @@ pub struct ControlRequest {
     pub method: String,
     pub params: Value,
     pub reply: Sender<ControlResponse>,
+    /// Stamped by the authenticated host, never read from client JSON.
+    pub agent_connection: Option<u64>,
 }
 
 impl ControlRequest {
     pub fn new(method: impl Into<String>, params: Value) -> (Self, std::sync::mpsc::Receiver<ControlResponse>) {
         let (tx, rx) = std::sync::mpsc::channel();
-        (Self { method: method.into(), params, reply: tx }, rx)
+        (Self { method: method.into(), params, reply: tx, agent_connection: None }, rx)
     }
 }
 
@@ -113,6 +115,11 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
             let params = p.get("params").cloned().filter(|v| !v.is_null()).unwrap_or(json!({}));
             if let Some(request) = p.get("request") {
                 let Some(request) = request.as_u64() else { return err("request must be an Ask Agent id") };
+                if let Some(conn) = req.agent_connection
+                    && !app.ask_agent.hub.as_ref().is_some_and(|h| h.owns(conn, request))
+                {
+                    return err("listen for this Ask Agent request on this connection before editing");
+                }
                 wrap(crate::ask_agent::run_for(app, request, id, params))
             } else {
                 wrap(app.run(id, params))

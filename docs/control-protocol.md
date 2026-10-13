@@ -149,3 +149,7 @@ unrelated work into its history. Selection and inspection commands do not create
 File, history, composition and UI commands cannot be attributed. Agent replies are accepted
 only from the connection that currently owns the request; reconnect, listen and reacquire it
 before replying. A cancelled request reports `{cancelled: true}`.
+
+Commands waiting for the window probe their connection every 250 ms. A disconnect releases
+ownership and requeues the request; queued commands from the old connection check ownership
+again on the UI thread and are refused before editing.

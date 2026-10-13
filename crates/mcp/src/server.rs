@@ -43,10 +43,15 @@ pub struct Server {
 struct RequestBackend {
     inner: Box<dyn Backend>,
     request: Option<u64>,
+    reacquire: bool,
 }
 
 impl Backend for RequestBackend {
     fn call(&mut self, method: &str, mut params: Value) -> Result<Value, String> {
+        if self.reacquire && !matches!(method, "agent.listen" | "engine.commands" | "document.inspect" | "ui.inspect" | "ui.render" | "ui.screenshot")
+        {
+            return Err("the Ask Agent connection lost its request; call wait_for_request to reacquire it before editing or replying".into());
+        }
         if method == "agent.listen" && self.request.is_some() {
             return Err("finish the current Ask Agent request with reply_to_request before waiting again".into());
         }
@@ -66,9 +71,27 @@ impl Backend for RequestBackend {
                 return Err("reply belongs to another Ask Agent request".into());
             }
         }
-        let result = self.inner.call(method, params.clone())?;
+        let result = match self.inner.call(method, params.clone()) {
+            Ok(result) => result,
+            Err(error) => {
+                if self.request.is_some()
+                    && (error.starts_with("listen for this") || error.starts_with("DeckCraft app at ") || error.starts_with("no Ask Agent request "))
+                {
+                    self.request = None;
+                    self.reacquire = true;
+                    return Err(format!("{error}; call wait_for_request to reacquire the request"));
+                }
+                if method == "agent.reply" && error.contains("is already answered") {
+                    self.request = None;
+                }
+                return Err(error);
+            }
+        };
         if method == "agent.listen" {
             self.request = result.get("id").and_then(Value::as_u64);
+            if self.request.is_some() {
+                self.reacquire = false;
+            }
         } else if method == "agent.reply"
             && (result.get("cancelled").and_then(Value::as_bool) == Some(true) || params.get("done").and_then(Value::as_bool).unwrap_or(true))
         {
@@ -94,7 +117,7 @@ fn error(id: Value, code: i64, message: impl Into<String>) -> Value {
 
 impl Server {
     pub fn new(backend: Box<dyn Backend>) -> Self {
-        Self { backend: Box::new(RequestBackend { inner: backend, request: None }), initialized: false }
+        Self { backend: Box::new(RequestBackend { inner: backend, request: None, reacquire: false }), initialized: false }
     }
 
     pub fn backend(&mut self) -> &mut dyn Backend {
@@ -144,7 +167,9 @@ impl Server {
 
     /// Handle one JSON-RPC message; `None` for notifications and responses.
     pub fn handle(&mut self, msg: Value) -> Option<Value> {
-        let Value::Object(o) = &msg else { return Some(error(Value::Null, INVALID_REQUEST, "message must be an object")) };
+        let Value::Object(o) = &msg else {
+            return Some(error(Value::Null, INVALID_REQUEST, "message must be an object"));
+        };
         let id = o.get("id").cloned();
         let Some(method) = o.get("method").and_then(Value::as_str) else {
             // A response to a server→client request (we send none): ignore. Anything else is invalid.

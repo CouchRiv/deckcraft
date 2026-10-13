@@ -76,3 +76,8 @@ for edits; direct pointer/key/text/UI calls are refused because they bypass grou
 A request stays tied to its original presentation (`document.id`). If the person edits during
 the request, further agent edits are refused: finish with an explanation and ask again.
 Use `run_command app.askAgent {instruction, scope: "deck"}` to queue a whole-deck request.
+
+After a connection or ownership failure, call `wait_for_request` again to reacquire work.
+The bridge forgets stale ownership and blocks edits and replies until a listen returns a
+request id; `{none: true}` does not grant ownership. A vanished/dismissed request is treated
+the same way. An already answered final reply releases the local request state.
