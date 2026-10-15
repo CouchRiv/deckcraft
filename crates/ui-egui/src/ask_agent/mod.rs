@@ -54,6 +54,8 @@ pub struct Open {
     pub turns: Vec<Turn>,
     pub instruction: String,
     commented: bool,
+    /// The slide comment holding this thread's answers; follow-ups reply to it.
+    thread: Option<(usize, usize)>,
 }
 
 /// Ask Agent state stored on [`SlideApp`].
@@ -148,10 +150,11 @@ pub fn command(app: &mut SlideApp, p: &Value) -> Result<Value, String> {
             document: doc,
             agent: app.ask_agent.picked.clone(),
         });
-        app.ask_agent.open = Some(Open { id, anchor, undo_group: None, turns: vec![], instruction: instr.to_string(), commented: false });
+        app.ask_agent.open =
+            Some(Open { id, anchor, undo_group: None, turns: vec![], instruction: instr.to_string(), commented: false, thread: None });
         return Ok(json!({"id": id}));
     }
-    app.ask_agent.open = Some(Open { id: 0, anchor, undo_group: None, turns: vec![], instruction: String::new(), commented: false });
+    app.ask_agent.open = Some(Open { id: 0, anchor, undo_group: None, turns: vec![], instruction: String::new(), commented: false, thread: None });
     Ok(json!({}))
 }
 
@@ -182,7 +185,8 @@ pub fn show(app: &mut SlideApp, ctx: &egui::Context) {
             && !hub.agents().is_empty()
             && ui::chip(ctx, anchor)
         {
-            app.ask_agent.open = Some(Open { id: 0, anchor, undo_group: None, turns: vec![], instruction: String::new(), commented: false });
+            app.ask_agent.open =
+                Some(Open { id: 0, anchor, undo_group: None, turns: vec![], instruction: String::new(), commented: false, thread: None });
         }
         return;
     };
@@ -201,8 +205,30 @@ pub fn show(app: &mut SlideApp, ctx: &egui::Context) {
 fn comment_once(app: &mut SlideApp, s: &Snapshot) {
     let Some(open) = app.ask_agent.open.as_mut().filter(|o| !o.commented) else { return };
     open.commented = true;
-    let (Some(answer), id) = (s.answer.clone(), open.id) else { return };
-    let _ = run_for(app, id, "comment.add", json!({"text": answer}));
+    let (Some(answer), id, thread) = (s.answer.clone(), open.id, open.thread) else { return };
+    // The first answer starts a comment thread; follow-ups reply in it.
+    if let Some((slide, index)) = thread {
+        // Navigation is not a document edit: target the original comment while
+        // preserving the person's current selection, including on failure.
+        let Some(st) = app.session.active_mut() else { return };
+        let selection = st.selection.clone();
+        st.selection.slide = slide;
+        let result = run_for(app, id, "comment.reply", json!({"index": index, "text": answer}));
+        if let Some(st) = app.session.active_mut() {
+            st.selection = selection;
+        }
+        if let Err(error) = result {
+            app.set_status(format!("Could not save the agent's reply: {error}"));
+        }
+    } else if let Ok(result) = run_for(app, id, "comment.add", json!({"text": answer})) {
+        let thread = app
+            .session
+            .active()
+            .and_then(|st| result["index"].as_u64().and_then(|index| usize::try_from(index).ok()).map(|index| (st.selection.slide, index)));
+        if let Some(open) = app.ask_agent.open.as_mut() {
+            open.thread = thread;
+        }
+    }
 }
 
 /// The shapes agents are working on, with each agent's colour.
@@ -385,8 +411,51 @@ mod tests {
         assert_eq!(acquired2.id, follow_id);
         assert_eq!(acquired2.history.len(), 1);
 
+        hub.reply(1, follow_id, "Done with the follow-up", true, None).unwrap();
+        comment_once(&mut app, &hub.snapshot(follow_id).unwrap());
+        // Repainting a completed answer must not append a second reply.
+        comment_once(&mut app, &hub.snapshot(follow_id).unwrap());
+        let st = app.session.active().unwrap();
+        let comments = &st.doc.slides[st.selection.slide].comments;
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].text, "Done inserting shape");
+        assert_eq!(comments[0].replies.len(), 1);
+        assert_eq!(comments[0].replies[0].text, "Done with the follow-up");
+        assert_eq!(comments[0].replies[0].author, "Agent (Codex)");
+        assert_eq!(st.history.undo.len(), 1, "edits, answer and reply share one undo group");
+
         handle_action(&mut app, Action::Undo);
         assert!(Arc::ptr_eq(&doc_before, &app.session.active().unwrap().doc));
         assert!(app.ask_agent.open.is_none());
+    }
+
+    #[test]
+    fn follow_up_stays_on_original_slide_after_navigation() {
+        let hub = AgentHub::default();
+        let mut app = SlideApp::new(Session::with_new(), crate::Services::default()).with_agent_hub(hub.clone());
+        app.run("slide.new", json!({})).unwrap();
+        app.session.active_mut().unwrap().selection.slide = 0;
+        let before = app.session.active().unwrap().doc.clone();
+        let undo_len = app.session.active().unwrap().history.undo.len();
+        let id = command(&mut app, &json!({"instruction": "review this slide"})).unwrap()["id"].as_u64().unwrap();
+        hub.listen(1, Some("Codex"), Duration::from_millis(50), || true).unwrap();
+        hub.reply(1, id, "First answer", true, None).unwrap();
+        comment_once(&mut app, &hub.snapshot(id).unwrap());
+
+        app.session.active_mut().unwrap().selection.slide = 1;
+        handle_action(&mut app, Action::Send("explain further".into()));
+        let follow_id = app.ask_agent.open.as_ref().unwrap().id;
+        hub.listen(1, Some("Codex"), Duration::from_millis(50), || true).unwrap();
+        hub.reply(1, follow_id, "More detail", true, None).unwrap();
+        comment_once(&mut app, &hub.snapshot(follow_id).unwrap());
+        let st = app.session.active().unwrap();
+        assert_eq!(st.selection.slide, 1, "person's navigation is preserved");
+        assert_eq!(st.doc.slides[0].comments.len(), 1);
+        assert_eq!(st.doc.slides[0].comments[0].replies[0].text, "More detail");
+        assert_eq!(st.doc.slides[0].comments[0].replies[0].author, "Agent (Codex)");
+        assert!(st.doc.slides[1].comments.is_empty());
+        assert_eq!(st.history.undo.len(), undo_len + 1);
+        handle_action(&mut app, Action::Undo);
+        assert!(Arc::ptr_eq(&before, &app.session.active().unwrap().doc));
     }
 }
