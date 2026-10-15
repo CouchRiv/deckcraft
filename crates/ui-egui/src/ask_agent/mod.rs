@@ -12,6 +12,40 @@ use serde_json::{Value, json};
 pub use hub::{AgentHub, HubError, Request, Snapshot, Status, Turn};
 pub use ui::Action;
 
+/// Editable starting points for requests to the connected agent.
+const QUICK_ACTIONS: &[ui::QuickAction] = &[
+    ui::QuickAction {
+        label: "Shorten",
+        group: "Rewrite",
+        instruction: "Shorten the selected slide text while preserving its meaning and key facts.",
+    },
+    ui::QuickAction {
+        label: "Professional",
+        group: "Rewrite",
+        instruction: "Rewrite the selected slide text in a clear, professional tone. Preserve its meaning and key facts.",
+    },
+    ui::QuickAction {
+        label: "Turn into bullets",
+        group: "",
+        instruction: "Turn the selected slide text into concise bullet points. Preserve its key facts.",
+    },
+    ui::QuickAction {
+        label: "Align and space",
+        group: "Layout",
+        instruction: "Align and evenly space the selected shapes to improve the slide layout. Preserve their content.",
+    },
+    ui::QuickAction {
+        label: "Match styling",
+        group: "Layout",
+        instruction: "Make the selected shapes use consistent styling that fits the slide. Preserve their content.",
+    },
+    ui::QuickAction {
+        label: "Speaker notes",
+        group: "",
+        instruction: "Draft concise speaker notes for the current slide using its existing content. Do not invent facts.",
+    },
+];
+
 use crate::SlideApp;
 
 /// The UI command.
@@ -195,7 +229,7 @@ pub fn show(app: &mut SlideApp, ctx: &egui::Context) {
         comment_once(app, s);
     }
     let agents = hub.agents();
-    let view = ui::View { snapshot: snapshot.as_ref(), agents: &agents };
+    let view = ui::View { snapshot: snapshot.as_ref(), agents: &agents, actions: QUICK_ACTIONS };
     if let Some(action) = ui::bubble(ctx, anchor, &view, &mut app.ask_agent.draft, &mut app.ask_agent.picked) {
         handle_action(app, action);
     }
