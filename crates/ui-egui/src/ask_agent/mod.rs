@@ -229,7 +229,8 @@ pub fn show(app: &mut SlideApp, ctx: &egui::Context) {
         comment_once(app, s);
     }
     let agents = hub.agents();
-    let view = ui::View { snapshot: snapshot.as_ref(), agents: &agents, actions: QUICK_ACTIONS };
+    let (history, instruction) = app.ask_agent.open.as_ref().map(|open| (open.turns.clone(), open.instruction.clone())).unwrap_or_default();
+    let view = ui::View { snapshot: snapshot.as_ref(), agents: &agents, actions: QUICK_ACTIONS, history: &history, instruction: &instruction };
     if let Some(action) = ui::bubble(ctx, anchor, &view, &mut app.ask_agent.draft, &mut app.ask_agent.picked) {
         handle_action(app, action);
     }
@@ -240,6 +241,7 @@ fn comment_once(app: &mut SlideApp, s: &Snapshot) {
     let Some(open) = app.ask_agent.open.as_mut().filter(|o| !o.commented) else { return };
     open.commented = true;
     let (Some(answer), id, thread) = (s.answer.clone(), open.id, open.thread) else { return };
+    let answer = format!("You: {}\n\nAgent: {answer}", open.instruction);
     // The first answer starts a comment thread; follow-ups reply in it.
     if let Some((slide, index)) = thread {
         // Navigation is not a document edit: target the original comment while
@@ -452,9 +454,9 @@ mod tests {
         let st = app.session.active().unwrap();
         let comments = &st.doc.slides[st.selection.slide].comments;
         assert_eq!(comments.len(), 1);
-        assert_eq!(comments[0].text, "Done inserting shape");
+        assert_eq!(comments[0].text, "You: make title bigger\n\nAgent: Done inserting shape");
         assert_eq!(comments[0].replies.len(), 1);
-        assert_eq!(comments[0].replies[0].text, "Done with the follow-up");
+        assert_eq!(comments[0].replies[0].text, "You: now make it red\n\nAgent: Done with the follow-up");
         assert_eq!(comments[0].replies[0].author, "Agent (Codex)");
         assert_eq!(st.history.undo.len(), 1, "edits, answer and reply share one undo group");
 
@@ -485,7 +487,7 @@ mod tests {
         let st = app.session.active().unwrap();
         assert_eq!(st.selection.slide, 1, "person's navigation is preserved");
         assert_eq!(st.doc.slides[0].comments.len(), 1);
-        assert_eq!(st.doc.slides[0].comments[0].replies[0].text, "More detail");
+        assert_eq!(st.doc.slides[0].comments[0].replies[0].text, "You: explain further\n\nAgent: More detail");
         assert_eq!(st.doc.slides[0].comments[0].replies[0].author, "Agent (Codex)");
         assert!(st.doc.slides[1].comments.is_empty());
         assert_eq!(st.history.undo.len(), undo_len + 1);
