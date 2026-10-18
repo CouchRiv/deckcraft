@@ -86,11 +86,11 @@
     {
       "app": "deckcraft",
       "gif": "deckcraft.gif",
-      "gif_bytes": 629695,
+      "gif_bytes": 615080,
       "gif_duration_ms": 56960,
-      "gif_sha256": "012341c2973f530d9db8f9d10e6f7027e6035dcb319398dac856d9bf9317f2bc",
+      "gif_sha256": "7f45fcdb6b7714c41fd56ad2f5a2399ff75dcd61573d54dde6505cb5a1bc1795",
       "mp4": "deckcraft.mp4",
-      "mp4_sha256": "62a33e47530fa3cb79c214c861eb5ae9ce212641b36e60a39e6f29f1d51472e2",
+      "mp4_sha256": "739f9dfaa84740e51a3de3d19791e33634f73582b7454bcd74aae3aa445c46c4",
       "probe": {
         "programs": [],
         "stream_groups": [],
@@ -135,7 +135,7 @@
   "source_code_commits": {
     "wordcraft": "9bb3e5badbac8d5156ea339d28ae3ff647d6a6ef",
     "gridcraft": "7d3074ac2068ba9ea99d198c0d3c205f681adba6",
-    "deckcraft": "804e2308d1a11be80668d51c39da64374195863f",
+    "deckcraft": "e334c6cc8a797a11d076a5174f58db073ba75f58",
     "pdfcraft": "68178cd586bc6fae2493508d6577397307edf302",
     "craft-libs": "313b5d81e60301a43f181c3316663920fd3c5245"
   }
