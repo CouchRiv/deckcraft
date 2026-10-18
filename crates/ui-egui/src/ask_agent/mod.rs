@@ -175,6 +175,7 @@ pub fn command(app: &mut SlideApp, p: &Value) -> Result<Value, String> {
     let anchor =
         app.ask_agent.anchor.map(|a| a.rect()).unwrap_or_else(|| egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(340.0, 200.0)));
     if let Some(instr) = p.get("instruction").and_then(Value::as_str) {
+        handle_action(app, Action::Close);
         let (sel, doc) = app.session.active().map(|st| (selection(st), document(st))).unwrap_or_default();
         let id = app.ask_agent.hub.as_ref().ok_or("no agent hub")?.ask(Request {
             id: 0,
@@ -188,6 +189,10 @@ pub fn command(app: &mut SlideApp, p: &Value) -> Result<Value, String> {
             Some(Open { id, anchor, undo_group: None, turns: vec![], instruction: instr.to_string(), commented: false, thread: None });
         return Ok(json!({"id": id}));
     }
+    if app.ask_agent.hub.is_none() {
+        return Err("Ask Agent needs an agent: start DeckCraft with --control PORT and run `deckcraft-cli mcp --connect PORT`".into());
+    }
+    handle_action(app, Action::Close);
     app.ask_agent.open = Some(Open { id: 0, anchor, undo_group: None, turns: vec![], instruction: String::new(), commented: false, thread: None });
     Ok(json!({}))
 }
@@ -198,14 +203,14 @@ pub fn typed_on_slide(app: &mut SlideApp, events: &[egui::Event]) {
         return;
     }
     if events.iter().any(|e| matches!(e, egui::Event::Text(_) | egui::Event::Paste(_))) {
-        app.ask_agent.open = None;
+        handle_action(app, Action::Close);
     }
 }
 
 /// Handle Escape key to dismiss open bubble.
 pub fn keyboard(app: &mut SlideApp, ctx: &egui::Context) {
     if app.ask_agent.open.is_some() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-        app.ask_agent.open = None;
+        handle_action(app, Action::Close);
     }
 }
 
@@ -293,9 +298,10 @@ pub fn held(app: &SlideApp, command: &str) -> Option<String> {
 }
 
 fn handle_action(app: &mut SlideApp, action: Action) {
-    let Some(hub) = app.ask_agent.hub.clone() else { return };
+    let hub = app.ask_agent.hub.clone();
     match action {
         Action::Send(text) => {
+            let Some(hub) = hub else { return };
             let (sel, doc) = app.session.active().map(|st| (selection(st), document(st))).unwrap_or_default();
             let agent = app.ask_agent.picked.clone();
             let Some(open) = &mut app.ask_agent.open else { return };
@@ -310,7 +316,9 @@ fn handle_action(app: &mut SlideApp, action: Action) {
         }
         Action::Undo => {
             let Some(open) = app.ask_agent.open.take() else { return };
-            hub.close(open.id);
+            if let Some(hub) = &hub {
+                hub.close(open.id);
+            }
             if let Some(ug) = open.undo_group
                 && let Some(st) = app.session.active_mut()
             {
@@ -326,7 +334,9 @@ fn handle_action(app: &mut SlideApp, action: Action) {
             }
         }
         Action::Keep | Action::Close => {
-            if let Some(open) = app.ask_agent.open.take() {
+            if let Some(open) = app.ask_agent.open.take()
+                && let Some(hub) = &hub
+            {
                 hub.close(open.id);
             }
         }
@@ -493,5 +503,27 @@ mod tests {
         assert_eq!(st.history.undo.len(), undo_len + 1);
         handle_action(&mut app, Action::Undo);
         assert!(Arc::ptr_eq(&before, &app.session.active().unwrap().doc));
+    }
+
+    #[test]
+    fn test_command_without_hub_returns_error() {
+        let mut app = SlideApp::new(Session::with_new(), crate::Services::default());
+        let err = command(&mut app, &json!({})).unwrap_err();
+        assert!(err.contains("Ask Agent needs an agent"));
+        assert!(app.ask_agent.open.is_none());
+    }
+
+    #[test]
+    fn test_dismiss_closes_request_in_hub() {
+        let hub = AgentHub::default();
+        let mut app = SlideApp::new(Session::with_new(), crate::Services::default()).with_agent_hub(hub.clone());
+
+        let res = command(&mut app, &json!({"instruction": "draft slide"})).unwrap();
+        let req_id = res["id"].as_u64().unwrap();
+        assert!(hub.snapshot(req_id).is_some());
+
+        typed_on_slide(&mut app, &[egui::Event::Text("a".into())]);
+        assert!(app.ask_agent.open.is_none());
+        assert!(hub.snapshot(req_id).is_none(), "typing dismisses and closes request in hub");
     }
 }

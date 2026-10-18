@@ -311,14 +311,13 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "id": {"type": "integer", "minimum": 0, "maximum": 9007199254740991u64},
                     "text": {"type": "string", "maxLength": 4000},
-                    "proposal": {"type": "string"},
                     "format": {"type": "string", "enum": ["text", "markdown"], "default": "text"},
                     "comment": {"type": "string", "maxLength": 2000},
                     "error": {"type": "string", "minLength": 1},
                     "done": {"type": "boolean", "default": true}
                 },
                 "required": ["id"],
-                "anyOf": [{"required": ["text"]}, {"required": ["proposal"]}, {"required": ["error"]}],
+                "anyOf": [{"required": ["text"]}, {"required": ["error"]}],
                 "additionalProperties": false
             }),
             false,
@@ -542,13 +541,13 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
                 return ToolResult::error("missing `id`: the request's id from wait_for_request");
             };
             let mut p = json!({"id": id});
-            for k in ["text", "proposal", "format", "comment", "error", "done"] {
+            for k in ["text", "format", "comment", "error", "done"] {
                 if let Some(v) = a.get(k).filter(|v| !v.is_null()) {
                     p[k] = v.clone();
                 }
             }
-            if p.get("text").is_none() && p.get("proposal").is_none() && p.get("error").is_none() {
-                return ToolResult::error("send at least one of `text`, `proposal` or `error`");
+            if p.get("text").is_none() && p.get("error").is_none() {
+                return ToolResult::error("send at least one of `text` or `error`");
             }
             wrap(b.call("agent.reply", p))
         }

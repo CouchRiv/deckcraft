@@ -288,8 +288,8 @@ fn ask_agent_schemas_are_the_contracts_common_ones() {
     let reply = find("reply_to_request");
     assert_eq!(reply["inputSchema"]["required"], json!(["id"]), "{reply}");
     assert_eq!(reply["inputSchema"]["additionalProperties"], false, "{reply}");
-    assert_eq!(reply["inputSchema"]["anyOf"].as_array().unwrap().len(), 3, "{reply}");
-    for p in ["text", "proposal", "format", "comment", "error", "done"] {
+    assert_eq!(reply["inputSchema"]["anyOf"].as_array().unwrap().len(), 2, "{reply}");
+    for p in ["text", "format", "comment", "error", "done"] {
         assert!(reply["inputSchema"]["properties"].get(p).is_some(), "{p}: {reply}");
     }
 
@@ -354,7 +354,7 @@ impl crate::Backend for ReconnectedAgent {
 #[test]
 fn ask_agent_reconnect_releases_stale_ownership_but_blocks_untagged_edits() {
     for refusal in [
-        "listen for this Ask Agent request on this connection before editing",
+        "Ask Agent request 7 is not yours: listen for it first",
         "DeckCraft app at synthetic is not reachable: disconnected",
         "no Ask Agent request 7: it was never made, or the person dismissed it",
     ] {

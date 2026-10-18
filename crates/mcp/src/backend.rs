@@ -82,7 +82,12 @@ impl Remote {
     /// Send `auth` with the token on a fresh connection; a refusal is a `PermissionDenied` error.
     fn authenticate(&mut self) -> std::io::Result<()> {
         let Some(token) = self.token.clone() else { return Ok(()) };
-        self.send(&json!({"id": 0, "method": "auth", "params": {"token": token}}).to_string())?;
+        let line = json!({"id": 0, "method": "auth", "params": {"token": token}}).to_string();
+        let Some((_, writer)) = self.conn.as_mut() else {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "not connected"));
+        };
+        writer.write_all(format!("{line}\n").as_bytes())?;
+        writer.flush()?;
         self.receive(0)?.map(drop).map_err(|why| std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("authentication failed: {why}")))
     }
 

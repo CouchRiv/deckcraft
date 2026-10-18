@@ -76,7 +76,10 @@ impl Backend for RequestBackend {
             Ok(result) => result,
             Err(error) => {
                 if self.request.is_some()
-                    && (error.starts_with("listen for this") || error.starts_with("DeckCraft app at ") || error.starts_with("no Ask Agent request "))
+                    && (error.contains("is not yours: listen for it first")
+                        || error.starts_with("listen for this")
+                        || error.starts_with("DeckCraft app at ")
+                        || error.starts_with("no Ask Agent request "))
                 {
                     self.request = None;
                     self.reacquire = true;
