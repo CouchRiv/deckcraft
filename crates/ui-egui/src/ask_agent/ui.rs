@@ -70,6 +70,11 @@ pub fn chip(ctx: &egui::Context, anchor: Rect) -> bool {
 /// follow-up field.
 pub fn bubble(ctx: &egui::Context, anchor: Rect, view: &View, draft: &mut String, picked: &mut Option<String>) -> Option<Action> {
     let mut action = None;
+    // True on the first pass the bubble shows after at least one pass without it.
+    let (id, pass) = (egui::Id::new("ask_agent_bubble_pass"), ctx.cumulative_pass_nr());
+    let last = ctx.data(|d| d.get_temp::<u64>(id));
+    ctx.data_mut(|d| d.insert_temp(id, pass));
+    let opened = last.is_none_or(|last| last + 1 < pass);
     egui::Area::new("ask_agent_bubble".into()).order(egui::Order::Foreground).fixed_pos(origin(ctx, anchor, WIDTH + 40.0)).constrain(true).show(
         ctx,
         |ui| {
@@ -160,9 +165,12 @@ pub fn bubble(ctx: &egui::Context, anchor: Rect, view: &View, draft: &mut String
                             .hint_text(hint)
                             .desired_rows(3)
                             .desired_width(f32::INFINITY)
-                            .margin(egui::Margin::symmetric(8, 6)),
+                            .margin(egui::Margin::symmetric(8, 6))
+                            // Shift+Enter makes a new line; Enter alone sends, below.
+                            .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::Enter)),
                     );
-                    if status.is_none() && !field.has_focus() && draft.is_empty() {
+                    // Focus the field once, when the bubble opens, so Tab can then reach the other controls.
+                    if status.is_none() && opened {
                         field.request_focus();
                     }
                     let enter = field.has_focus() && ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
@@ -252,11 +260,18 @@ pub fn agent_label(ui: &mut egui::Ui, name: &str) {
 /// A drawn four-point sparkle in the selection colour, so it shows whatever the interface font.
 fn sparkle(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(vec2(12.0, 12.0), egui::Sense::hover());
-    let (c, colour) = (rect.center(), ui.visuals().selection.stroke.color);
+    let (c, colour) = (rect.center(), accent(ui.visuals()));
     for (long, short) in [(vec2(0.0, 6.0), vec2(1.6, 0.0)), (vec2(6.0, 0.0), vec2(0.0, 1.6))] {
         let points = vec![c - long, c + short, c + long, c - short];
         ui.painter().add(egui::Shape::convex_polygon(points, colour, Stroke::NONE));
     }
+}
+
+/// Of the selection's fill and text colours, the one that stands out more on the bubble.
+fn accent(v: &egui::Visuals) -> Color32 {
+    let luma = |c: Color32| 0.299 * f32::from(c.r()) + 0.587 * f32::from(c.g()) + 0.114 * f32::from(c.b());
+    let (fill, text, bg) = (v.selection.bg_fill, v.selection.stroke.color, luma(v.window_fill));
+    if (luma(fill) - bg).abs() > (luma(text) - bg).abs() { fill } else { text }
 }
 
 /// A drawn ✕, so it shows whatever the interface font.
