@@ -213,6 +213,53 @@ fn authenticate(line: &str, token: &str) -> (Value, bool) {
     }
 }
 
+/// One request line, parsed.
+enum Parsed {
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
+    Blank,
+    /// Not a request: reply with this error and close the connection.
+    Reject(String),
+}
+
+fn parse(bytes: &[u8]) -> Parsed {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Parsed::Reject("not a control request (invalid UTF-8); closing the connection".into());
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return Parsed::Blank;
+    }
+    if is_http_request_line(text) {
+        return Parsed::Reject("HTTP is not served here: this port takes JSON lines; closing the connection".into());
+    }
+    let msg = match serde_json::from_str::<Value>(text) {
+        Ok(v) => v,
+        Err(e) => return Parsed::Reject(format!("bad JSON ({e}); expected one JSON request object per line; closing the connection")),
+    };
+    let Some(obj) = msg.as_object() else {
+        return Parsed::Reject("not a control request (expected a JSON object); closing the connection".into());
+    };
+    let Some(method) = obj.get("method").and_then(Value::as_str) else {
+        return Parsed::Reject("not a control request (missing string `method`); closing the connection".into());
+    };
+    Parsed::Request {
+        id: obj.get("id").cloned().unwrap_or(Value::Null),
+        method: method.to_string(),
+        params: obj.get("params").cloned().unwrap_or(json!({})),
+    }
+}
+
+/// An HTTP/1 request line (`POST / HTTP/1.1`) or the HTTP/2 preface (`PRI * HTTP/2.0`).
+fn is_http_request_line(text: &str) -> bool {
+    const METHODS: [&str; 10] = ["GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH", "PRI"];
+    text.split_once(' ').is_some_and(|(method, _)| METHODS.contains(&method))
+        || text.rsplit_once(' ').is_some_and(|(_, version)| version.starts_with("HTTP/"))
+}
+
 fn serve(stream: TcpStream, token: &str, tx: &SyncSender<ControlRequest>, ctx: &egui::Context, agents: &AgentHub, conn: u64, limits: Limits) {
     if stream.set_read_timeout(Some(limits.idle_timeout)).is_err() || stream.set_write_timeout(Some(limits.write_timeout)).is_err() {
         return;
@@ -233,27 +280,30 @@ fn serve(stream: TcpStream, token: &str, tx: &SyncSender<ControlRequest>, ctx: &
             }
             Line::Closed => break,
         };
-        let Ok(line) = String::from_utf8(line) else {
-            if writeln!(out, "{}", json!({"ok": false, "error": "bad JSON: not UTF-8"})).is_err() {
+        let reply = match parse(&line) {
+            Parsed::Blank => continue,
+            Parsed::Reject(e) => {
+                // The connection closes either way; a peer that can't read the reason loses nothing.
+                let _ = writeln!(out, "{}", json!({"ok": false, "error": e}));
                 break;
             }
-            continue;
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        if !authenticated {
-            let (reply, ok) = authenticate(&line, token);
-            if writeln!(out, "{reply}").is_err() || !ok {
-                break;
-            }
-            authenticated = true;
-            continue;
-        }
-        let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => {
-                let id = msg.get("id").cloned().unwrap_or(Value::Null);
-                let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+            Parsed::Request { id, method, params } => {
+                if !authenticated {
+                    let is_auth = method == "auth";
+                    let given = params.get("token").and_then(Value::as_str);
+                    let (auth_reply, ok) = match given {
+                        Some(t) if is_auth && auth::tokens_match(t, token) => {
+                            (json!({"id": id, "ok": true, "result": {"authenticated": true}}), true)
+                        }
+                        _ if is_auth => (json!({"id": id, "ok": false, "error": "wrong token"}), false),
+                        _ => (json!({"id": id, "ok": false, "error": AUTH_FIRST}), false),
+                    };
+                    if writeln!(out, "{auth_reply}").is_err() || !ok {
+                        break;
+                    }
+                    authenticated = true;
+                    continue;
+                }
                 // A repeated `auth` is answered here, never dispatched to the UI.
                 if method == "auth" {
                     if writeln!(out, "{}", json!({"id": id, "ok": true, "result": {"authenticated": true}})).is_err() {
@@ -261,7 +311,6 @@ fn serve(stream: TcpStream, token: &str, tx: &SyncSender<ControlRequest>, ctx: &
                     }
                     continue;
                 }
-                let params = msg.get("params").cloned().unwrap_or(json!({}));
                 // Ask Agent: answered here, on the connection's own thread.
                 if let Some(mut r) = agents.handle(conn, &method, &params, || peer_open(&probe)) {
                     r["id"] = id;
@@ -288,7 +337,6 @@ fn serve(stream: TcpStream, token: &str, tx: &SyncSender<ControlRequest>, ctx: &
                 }
                 r
             }
-            Err(e) => json!({"ok": false, "error": format!("bad JSON: {e}")}),
         };
         if let Err(e) = writeln!(out, "{reply}") {
             if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
@@ -501,6 +549,45 @@ mod limits_tests {
         let v = reply(&mut r).unwrap();
         assert_eq!(v["id"], 7);
         assert_eq!(v["result"], "ui.inspect");
+    }
+
+    /// Every reply line until the server closes the connection.
+    fn replies_until_closed(r: &mut BufReader<TcpStream>) -> Vec<Value> {
+        std::iter::from_fn(|| reply(r)).collect()
+    }
+
+    /// A browser can POST to the port: its request line closes the connection before the JSON
+    /// line in its body is read, so nothing is dispatched.
+    #[test]
+    fn an_http_request_closes_the_connection_before_its_body_is_dispatched() {
+        let (addr, rx) = server(Limits { max_line: 512, ..small() });
+        let (mut r, mut w) = client(addr);
+        w.write_all(
+            b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: text/plain\r\n\r\n\
+              {\"id\":1,\"method\":\"engine.execute\",\"params\":{\"command\":\"slide.new\"}}\n",
+        )
+        .unwrap();
+        let replies = replies_until_closed(&mut r);
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert!(replies[0]["error"].as_str().unwrap().contains("closing the connection"), "{replies:?}");
+        assert!(rx.try_recv().is_err(), "the body was dispatched");
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_request_closes_the_connection() {
+        let (addr, rx) = server(small());
+        ui(rx);
+        for junk in [&b"hello\n"[..], b"[1,2]\n", b"{\"id\":1}\n", b"{\"method\":5}\n", b"\xff\xfe\n", b"GET /x HTTP/1.1\n"] {
+            let (mut r, mut w) = raw(addr);
+            w.write_all(junk).unwrap();
+            w.write_all(b"{\"id\":2,\"method\":\"m\"}\n").unwrap();
+            let replies = replies_until_closed(&mut r);
+            assert_eq!(replies.len(), 1, "{replies:?}");
+            assert_eq!(replies[0]["ok"], false);
+        }
+        assert!(is_http_request_line("OPTIONS * HTTP/1.1"));
+        assert!(is_http_request_line("PRI * HTTP/2.0"));
+        assert!(!is_http_request_line("{\"method\":\"GET /\"}"));
     }
 
     #[test]

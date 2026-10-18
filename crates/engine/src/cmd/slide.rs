@@ -218,6 +218,9 @@ fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
                 && let Some(sec) = doc.sections.get_mut(si)
             {
                 sec.slides.push(nid);
+                // Keep the section list in document order so the copy sits next to its source.
+                let order: Vec<SlideId> = doc.slides.iter().map(|x| x.id).collect();
+                sec.slides.sort_by_key(|x| order.iter().position(|o| o == x).unwrap_or(usize::MAX));
             }
         }
         sel.slide = (last + new_ids.len()).min(doc.slides.len().saturating_sub(1));
@@ -624,6 +627,17 @@ fn from_outline(s: &mut Session, p: &Value) -> Result<Value> {
         for (k, sl) in new.into_iter().enumerate() {
             doc.slides.insert(at + k, sl);
         }
+        // Join the section of the slide before, as slide.new does.
+        let ids: Vec<SlideId> = doc.slides.iter().skip(at).take(n).map(|x| x.id).collect();
+        let prev = at.checked_sub(1).and_then(|i| doc.slides.get(i)).map(|x| x.id);
+        let section = prev.and_then(|p| doc.section_of(p));
+        if let Some(sec) = section.and_then(|si| doc.sections.get_mut(si)) {
+            let pos = prev.and_then(|p| sec.slides.iter().position(|x| *x == p)).map(|k| k + 1).unwrap_or(sec.slides.len());
+            let pos = pos.min(sec.slides.len());
+            sec.slides.splice(pos..pos, ids);
+        } else if let Some(first) = doc.sections.first_mut() {
+            first.slides.splice(0..0, ids);
+        }
         Ok(json!({"slides": n}))
     })
 }
@@ -633,6 +647,23 @@ mod tests {
     use serde_json::json;
 
     use crate::Session;
+
+    #[test]
+    fn duplicate_keeps_section_order_in_step_with_slides() {
+        let mut s = Session::with_new();
+        while s.doc().expect("doc").doc.slides.len() < 3 {
+            s.execute("slide.new", &json!({})).expect("new slide");
+        }
+        s.execute("section.add", &json!({"at": 0})).expect("section");
+        let orig = s.doc().expect("doc").doc.slides.first().expect("slide").id;
+        s.execute("slide.duplicate", &json!({"index": 0})).expect("dup");
+        let st = s.doc().expect("doc");
+        let all: Vec<_> = st.doc.slides.iter().map(|x| x.id).collect();
+        let sec = &st.doc.sections.first().expect("section").slides;
+        assert_eq!(all.len(), 4);
+        assert_eq!(sec, &all, "section order must match slide order");
+        assert_eq!(sec.first(), Some(&orig));
+    }
 
     #[test]
     fn new_slide_body_leading_tabs_become_levels() {

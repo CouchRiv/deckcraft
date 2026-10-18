@@ -66,7 +66,7 @@ Coordinates are slide points (1/72 inch; a 16:9 slide is 960 × 540) unless note
 | `ui.render` | `{path?, slide?, scale?}` | Render a slide headlessly |
 | `ui.resize` / `ui.focus` | | Window control |
 | `show.start` / `show.end` | `{from?: slide index, custom?: name, reading?}` | Slide show. `custom` plays that custom show from its first slide and does not change Set Up. With no `from` and no `custom`, playback starts at the first slide of the show order |
-| `app.open` / `app.save` / `app.export` / `app.quit` | `{path, …}` | Files (export takes the `file.export` params, e.g. `{"path": "deck.pdf", "layout": "handouts", "perPage": 3}` or `{"path": "deck.gif", "width": "large", "secondsPerSlide": 3, "loop": false}`) |
+| `app.open` / `app.save` / `app.export` / `app.quit` | `{path, …}` | Files (export takes the `file.export` params, e.g. `{"path": "deck.pdf", "layout": "handouts", "perPage": 3}` or `{"path": "deck.gif", "width": "large", "secondsPerSlide": 3, "loop": false}`, or `{"path": "slide.png", "transparentBackground": true}` for a PNG without the slide background) |
 | `agent.listen` | `{timeoutMs?, agent?}` | Ask Agent: the next request from the window, or `{none: true}` (see [Ask Agent](#ask-agent)) |
 | `agent.reply` | `{id, text, done?, error?}` | Ask Agent: the agent's progress note (`done: false`), answer, or `error`, shown in the window |
 

@@ -169,13 +169,24 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
+/// Keeps a side length in `0..=MAX_PT` so a huge value cannot exhaust memory when rendering.
+/// An overflow to infinity lands on the limit; NaN becomes 0.
+fn clamp_side(v: f64) -> f64 {
+    if v.is_nan() { 0.0 } else { v.clamp(0.0, MAX_PT) }
+}
+
+/// Keeps a coordinate within `±POS_LIMIT`.
+fn clamp_pos(v: f64) -> f64 {
+    if v.is_nan() { 0.0 } else { v.clamp(-POS_LIMIT, POS_LIMIT) }
+}
+
 fn move_by(s: &mut Session, p: &Value) -> Result<Value> {
     let (dx, dy) = (f64_param(p, "dx"), f64_param(p, "dy"));
     let (ax, ay) = (f64_param(p, "x"), f64_param(p, "y"));
     edit_geometry(s, p, "shape.move", |sh| {
         if let Some(x) = sh.xfrm.as_mut() {
-            x.x = ax.unwrap_or(x.x) + dx.unwrap_or(0.0);
-            x.y = ay.unwrap_or(x.y) + dy.unwrap_or(0.0);
+            x.x = clamp_pos(ax.unwrap_or(x.x) + dx.unwrap_or(0.0));
+            x.y = clamp_pos(ay.unwrap_or(x.y) + dy.unwrap_or(0.0));
         }
         Ok(())
     })
@@ -202,10 +213,12 @@ fn resize(s: &mut Session, p: &Value) -> Result<Value> {
                     x.h = h.unwrap_or(x.h);
                 }
             }
+            x.w = clamp_side(x.w);
+            x.h = clamp_side(x.h);
             // Rotated shapes resize about their centre; others keep the top-left.
             if x.rot != 0.0 {
-                x.x = cx - x.w / 2.0;
-                x.y = cy - x.h / 2.0;
+                x.x = clamp_pos(cx - x.w / 2.0);
+                x.y = clamp_pos(cy - x.h / 2.0);
             }
         }
         Ok(())
@@ -215,10 +228,10 @@ fn resize(s: &mut Session, p: &Value) -> Result<Value> {
 fn set_bounds(s: &mut Session, p: &Value) -> Result<Value> {
     edit_geometry(s, p, "shape.setBounds", |sh| {
         if let Some(x) = sh.xfrm.as_mut() {
-            x.x = f64_param(p, "x").unwrap_or(x.x);
-            x.y = f64_param(p, "y").unwrap_or(x.y);
-            x.w = f64_param(p, "w").unwrap_or(x.w).max(0.0);
-            x.h = f64_param(p, "h").unwrap_or(x.h).max(0.0);
+            x.x = clamp_pos(f64_param(p, "x").unwrap_or(x.x));
+            x.y = clamp_pos(f64_param(p, "y").unwrap_or(x.y));
+            x.w = clamp_side(f64_param(p, "w").unwrap_or(x.w));
+            x.h = clamp_side(f64_param(p, "h").unwrap_or(x.h));
         }
         Ok(())
     })
@@ -406,6 +419,8 @@ fn flip(s: &mut Session, p: &Value) -> Result<Value> {
             } else {
                 x.flip_h = !x.flip_h;
             }
+            // `Xfrm::affine` flips first and rotates second; a true mirror also negates the rotation.
+            x.rot = (360.0 - x.rot_norm()) % 360.0;
         }
         Ok(())
     })
@@ -1150,19 +1165,17 @@ fn media_options(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({}))
 }
 
-fn shape_id(p: &Value, key: &str) -> Option<deckcraft_model::ShapeId> {
-    p.get(key).and_then(Value::as_u64).map(|v| deckcraft_model::ShapeId(v as u32))
-}
-
 fn sites(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = shape_id(p, "id").ok_or_else(|| bad("shape.sites", "missing `id`"))?;
+    let id = id_param(p, "id", "shape.sites")?.ok_or_else(|| bad("shape.sites", "missing `id`"))?;
     let st = s.doc()?;
     let sh = st.shape(id).ok_or_else(|| bad("shape.sites", "no such shape"))?;
     Ok(json!(crate::connect::sites(&st.doc, &st.selection, sh).iter().map(|q| [q.x, q.y]).collect::<Vec<_>>()))
 }
 
 fn connect(s: &mut Session, p: &Value) -> Result<Value> {
-    let (Some(from), Some(to)) = (shape_id(p, "from"), shape_id(p, "to")) else { return Err(bad("shape.connect", "missing `from` / `to`")) };
+    let (Some(from), Some(to)) = (id_param(p, "from", "shape.connect")?, id_param(p, "to", "shape.connect")?) else {
+        return Err(bad("shape.connect", "missing `from` / `to`"));
+    };
     let st = s.doc()?;
     let site_list = |id| st.shape(id).map(|sh| crate::connect::sites(&st.doc, &st.selection, sh)).unwrap_or_default();
     let (a, b) = (site_list(from), site_list(to));
@@ -1186,7 +1199,7 @@ fn connect(s: &mut Session, p: &Value) -> Result<Value> {
         }
     };
     let (p0, p1) = (a[ia], b[ib]);
-    let id = match shape_id(p, "id") {
+    let id = match id_param(p, "id", "shape.connect")? {
         Some(id) => id,
         None => {
             let preset = str_param(p, "preset").unwrap_or("straightConnector1");
