@@ -78,6 +78,8 @@ pub struct UndoGroup {
     pub selection: deckcraft_engine::Selection,
     pub after: Arc<deckcraft_model::Presentation>,
     pub undo_len: usize,
+    /// The point type Edit Points remembered with `before`.
+    pub vertex_kind: Option<(deckcraft_model::ShapeId, usize, usize, String)>,
 }
 
 /// An open Ask Agent conversation in the UI.
@@ -365,6 +367,7 @@ pub fn run_for(app: &mut SlideApp, request: u64, id: &str, params: Value) -> Res
     }
 
     let (uid, before, selection, undo_len, limit) = (st.uid, st.doc.clone(), st.selection.clone(), st.history.undo.len(), st.history.limit);
+    let vertex_kind = app.session.tool.vertex_kind.clone();
 
     if let Some(st) = app.session.active_mut() {
         st.history.limit = limit.max(1).saturating_add(1);
@@ -389,23 +392,35 @@ pub fn run_for(app: &mut SlideApp, request: u64, id: &str, params: Value) -> Res
             st.revision += 1;
             return Err("this command changes the document without undo support".into());
         }
-        let (ug_before, ug_sel, ug_undo_len) = if let Some(open) = &app.ask_agent.open
+        let (ug_before, ug_sel, ug_undo_len, ug_vertex_kind) = if let Some(open) = &app.ask_agent.open
             && open.id == request
             && let Some(ug) = &open.undo_group
         {
-            (ug.before.clone(), ug.selection.clone(), ug.undo_len)
+            (ug.before.clone(), ug.selection.clone(), ug.undo_len, ug.vertex_kind.clone())
         } else {
-            (before, selection, undo_len)
+            (before, selection, undo_len, vertex_kind)
         };
 
         st.history.undo.truncate(ug_undo_len);
-        st.history.undo.push(deckcraft_engine::HistoryEntry { label: "Ask Agent".into(), doc: ug_before.clone(), selection: ug_sel.clone() });
+        st.history.undo.push(deckcraft_engine::HistoryEntry {
+            label: "Ask Agent".into(),
+            doc: ug_before.clone(),
+            selection: ug_sel.clone(),
+            vertex_kind: ug_vertex_kind.clone(),
+        });
         st.history.redo.clear();
 
         if let Some(open) = &mut app.ask_agent.open
             && open.id == request
         {
-            open.undo_group = Some(UndoGroup { uid, before: ug_before, selection: ug_sel, after: st.doc.clone(), undo_len: ug_undo_len });
+            open.undo_group = Some(UndoGroup {
+                uid,
+                before: ug_before,
+                selection: ug_sel,
+                after: st.doc.clone(),
+                undo_len: ug_undo_len,
+                vertex_kind: ug_vertex_kind,
+            });
         }
     }
     Ok(result)

@@ -364,15 +364,7 @@ fn serve(stream: TcpStream, token: &str, tx: &SyncSender<ControlRequest>, ctx: &
             }
             Parsed::Request { id, method, params } => {
                 if !authenticated {
-                    let is_auth = method == "auth";
-                    let given = params.get("token").and_then(Value::as_str);
-                    let (auth_reply, ok) = match given {
-                        Some(t) if is_auth && auth::tokens_match(t, token) => {
-                            (json!({"id": id, "ok": true, "result": {"authenticated": true}}), true)
-                        }
-                        _ if is_auth => (json!({"id": id, "ok": false, "error": "wrong token"}), false),
-                        _ => (json!({"id": id, "ok": false, "error": AUTH_FIRST}), false),
-                    };
+                    let (auth_reply, ok) = authenticate(&String::from_utf8_lossy(&line), token);
                     if writeln!(out, "{auth_reply}").is_err() || !ok {
                         break;
                     }
