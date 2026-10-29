@@ -14,7 +14,7 @@
 //! line length, queued requests, and how long a socket may sit idle or blocked on a write.
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
@@ -88,19 +88,38 @@ pub fn start(port: u16, ctx: egui::Context, agents: AgentHub) -> Option<Receiver
     Some(serve_on(listener, token, Limits::default(), ctx, agents))
 }
 
+/// How long the accepting thread waits after a failed accept. Accepting can keep failing, for
+/// example while the process has no file descriptors left, and retrying at once would keep a
+/// core busy until it recovers.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+
+/// The longest a connection refused as busy is drained before it is closed.
+const REFUSED_GRACE: Duration = Duration::from_millis(250);
+
+/// Refused connections drained at once, each on a thread of its own. Past this many, a refused
+/// connection gets the busy reply and is closed without a drain.
+const MAX_REFUSING: usize = 16;
+
+/// The connections `incoming` accepts, calling `wait` after each failed accept.
+fn accepted<T>(incoming: impl Iterator<Item = std::io::Result<T>>, mut wait: impl FnMut()) -> impl Iterator<Item = T> {
+    incoming.filter_map(move |stream| stream.map_err(|_| wait()).ok())
+}
+
 /// Accept connections on `listener` under `limits`; requests arrive on the returned receiver.
 fn serve_on(listener: TcpListener, token: String, limits: Limits, ctx: egui::Context, agents: AgentHub) -> Receiver<ControlRequest> {
     let (tx, rx) = sync_channel::<ControlRequest>(limits.queue.max(1));
     let token = Arc::new(token);
     let active = Arc::new(AtomicUsize::new(0));
+    let refusing = Arc::new(AtomicUsize::new(0));
     std::thread::spawn(move || {
         // Each connection's number, for Ask Agent's presence.
         let mut conn = 0u64;
-        for mut stream in listener.incoming().flatten() {
+        for mut stream in accepted(listener.incoming(), || std::thread::sleep(ACCEPT_RETRY)) {
             let _ = stream.set_write_timeout(Some(limits.write_timeout));
             if active.fetch_add(1, Ordering::SeqCst) >= limits.max_clients {
                 active.fetch_sub(1, Ordering::SeqCst);
                 let _ = writeln!(stream, "{}", json!({"ok": false, "error": "busy: too many control connections"}));
+                refuse(stream, &refusing, limits.write_timeout.min(REFUSED_GRACE));
                 continue;
             }
             conn = conn.wrapping_add(1);
@@ -159,6 +178,27 @@ fn wait_for_ui(rx: &Receiver<Value>, state: &AtomicU8, probe: &TcpStream, agents
             Err(RecvTimeoutError::Disconnected) => return json!({"ok": false, "error": "control channel closed"}),
             Err(RecvTimeoutError::Timeout) => {}
         }
+    }
+}
+
+/// Close a connection that was told it is refused. A peer that wrote a line before it read the
+/// reply would see only a reset, so the connection is drained for up to `grace` first, on a
+/// thread of its own: the accepting thread goes straight back to accepting. Past
+/// [`MAX_REFUSING`] drains at once, the connection is closed without one.
+fn refuse(stream: TcpStream, refusing: &Arc<AtomicUsize>, grace: Duration) {
+    if refusing.fetch_add(1, Ordering::SeqCst) >= MAX_REFUSING {
+        refusing.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    let slot = Slot(Arc::clone(refusing));
+    let spawned = std::thread::Builder::new().name("control-refused".into()).spawn(move || {
+        let _slot = slot;
+        if let Ok(read) = stream.try_clone() {
+            close_politely(&stream, &mut BufReader::new(read), grace);
+        }
+    });
+    if spawned.is_err() {
+        log::warn!("control server could not start a thread to close a refused connection");
     }
 }
 
@@ -260,6 +300,37 @@ fn is_http_request_line(text: &str) -> bool {
         || text.rsplit_once(' ').is_some_and(|(_, version)| version.starts_with("HTTP/"))
 }
 
+/// Close after the last reply so the peer can still read it. A peer that had sent another line
+/// before the reply arrived -- two lines in one write, which any script does -- leaves input
+/// unread in the socket, and closing a socket with unread input resets the connection: the reply
+/// already queued for the peer is discarded and it sees only the reset. Sending the FIN first and
+/// then draining, briefly and boundedly, makes the close orderly and the reason survive.
+fn close_politely(out: &TcpStream, reader: &mut BufReader<TcpStream>, grace: Duration) {
+    if out.shutdown(Shutdown::Write).is_err() {
+        return;
+    }
+    // Enough for a pipelined line or two; a peer that keeps talking is dropped at the deadline.
+    // The timeout is what is left of the grace before each read, not the whole of it: a peer that
+    // sends a byte just before each one expires would otherwise hold this thread, and its slot,
+    // for close to twice as long as the deadline says. The timeout is set on the handle that
+    // reads: on Windows, a read timeout set on one handle of a `try_clone` pair can fail to apply
+    // to reads through the other.
+    const MAX_DRAIN: usize = 64 << 10;
+    let until = Instant::now() + grace;
+    let mut sink = [0u8; 4 << 10];
+    let mut drained = 0;
+    while drained < MAX_DRAIN {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() || reader.get_ref().set_read_timeout(Some(left)).is_err() {
+            break;
+        }
+        match reader.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => drained += n,
+        }
+    }
+}
+
 fn serve(stream: TcpStream, token: &str, tx: &SyncSender<ControlRequest>, ctx: &egui::Context, agents: &AgentHub, conn: u64, limits: Limits) {
     if stream.set_read_timeout(Some(limits.idle_timeout)).is_err() || stream.set_write_timeout(Some(limits.write_timeout)).is_err() {
         return;
@@ -276,6 +347,7 @@ fn serve(stream: TcpStream, token: &str, tx: &SyncSender<ControlRequest>, ctx: &
             Line::Text(t) => t,
             Line::TooLong => {
                 let _ = writeln!(out, "{}", json!({"ok": false, "error": format!("request line longer than {} bytes", limits.max_line)}));
+                close_politely(&out, &mut reader, limits.write_timeout);
                 break;
             }
             Line::Closed => break,
@@ -283,8 +355,11 @@ fn serve(stream: TcpStream, token: &str, tx: &SyncSender<ControlRequest>, ctx: &
         let reply = match parse(&line) {
             Parsed::Blank => continue,
             Parsed::Reject(e) => {
-                // The connection closes either way; a peer that can't read the reason loses nothing.
+                // The connection closes either way, but the peer is told why first: see
+                // `close_politely`, without which a peer that had pipelined another line had this
+                // reply reset away and saw nothing.
                 let _ = writeln!(out, "{}", json!({"ok": false, "error": e}));
+                close_politely(&out, &mut reader, limits.write_timeout);
                 break;
             }
             Parsed::Request { id, method, params } => {
@@ -351,350 +426,7 @@ fn serve(stream: TcpStream, token: &str, tx: &SyncSender<ControlRequest>, ctx: &
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const TOKEN: &str = "0123456789abcdef";
-
-    #[test]
-    fn only_the_right_token_authenticates() {
-        let (reply, ok) = authenticate(&json!({"id": 1, "method": "auth", "params": {"token": TOKEN}}).to_string(), TOKEN);
-        assert!(ok);
-        assert_eq!(reply["ok"], true);
-        assert_eq!(reply["id"], 1);
-        for line in [
-            json!({"id": 1, "method": "auth", "params": {"token": "wrong"}}).to_string(),
-            json!({"id": 1, "method": "auth", "params": {}}).to_string(),
-            json!({"id": 1, "method": "auth"}).to_string(),
-            json!({"id": 1, "method": "app.save", "params": {"path": "/tmp/x.pptx", "token": TOKEN}}).to_string(),
-        ] {
-            let (reply, ok) = authenticate(&line, TOKEN);
-            assert!(!ok, "{line}");
-            assert_eq!(reply["ok"], false, "{line}");
-        }
-    }
-
-    #[test]
-    fn an_http_request_is_refused() {
-        // The first line a browser sends for `fetch("http://127.0.0.1:PORT", {method: "POST", body})`.
-        let (reply, ok) = authenticate("POST / HTTP/1.1", TOKEN);
-        assert!(!ok);
-        assert_eq!(reply["ok"], false);
-    }
-
-    /// Over a real socket: an unauthenticated request is refused and the connection closed; after
-    /// `auth`, requests reach the UI channel.
-    #[test]
-    fn requests_reach_the_ui_only_after_auth() {
-        use std::io::Read as _;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = sync_channel(4);
-        let server = std::thread::spawn(move || {
-            for stream in listener.incoming().take(2) {
-                serve(stream.unwrap(), TOKEN, &tx, &egui::Context::default(), &AgentHub::default(), 1, Limits::default());
-            }
-        });
-
-        // No auth: refused, closed, nothing dispatched.
-        let mut s = TcpStream::connect(addr).unwrap();
-        writeln!(s, "{}", json!({"id": 1, "method": "app.quit"})).unwrap();
-        let mut rest = String::new();
-        s.read_to_string(&mut rest).unwrap();
-        assert!(rest.contains("authenticate first"), "{rest}");
-        assert!(rx.try_recv().is_err());
-
-        // Auth, then a request the UI answers.
-        let s = TcpStream::connect(addr).unwrap();
-        let mut w = s.try_clone().unwrap();
-        let mut r = BufReader::new(s);
-        writeln!(w, "{}", json!({"id": 1, "method": "auth", "params": {"token": TOKEN}})).unwrap();
-        let mut line = String::new();
-        r.read_line(&mut line).unwrap();
-        assert!(line.contains("\"authenticated\":true"), "{line}");
-        writeln!(w, "{}", json!({"id": 2, "method": "ui.inspect"})).unwrap();
-        let req = rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert_eq!(req.method, "ui.inspect");
-        let _ = req.reply.send(json!({"ok": true, "result": {}}));
-        line.clear();
-        r.read_line(&mut line).unwrap();
-        assert!(line.contains("\"id\":2"), "{line}");
-        drop((w, r));
-        server.join().unwrap();
-    }
-
-    // Ask Agent.
-
-    use deckcraft_ui_egui::ask_agent::{Request, Status};
-    use std::time::Instant;
-
-    fn boot() -> (u16, Receiver<ControlRequest>, AgentHub) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let agents = AgentHub::default();
-        (port, serve_on(listener, TOKEN.to_string(), Limits::default(), egui::Context::default(), agents.clone()), agents)
-    }
-
-    struct Conn(BufReader<TcpStream>, TcpStream);
-
-    impl Conn {
-        fn authed(port: u16) -> Self {
-            let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
-            let mut c = Conn(BufReader::new(s.try_clone().unwrap()), s);
-            assert_eq!(c.call(&json!({"id": 0, "method": "auth", "params": {"token": TOKEN}}))["ok"], true);
-            c
-        }
-        fn call(&mut self, v: &Value) -> Value {
-            writeln!(self.1, "{v}").unwrap();
-            let mut line = String::new();
-            self.0.read_line(&mut line).unwrap();
-            serde_json::from_str(&line).unwrap_or(Value::Null)
-        }
-    }
-
-    fn ask(agents: &AgentHub) -> u64 {
-        let selection = json!({"kind": "shapes", "shapes": [{"id": 258, "text": "Kilns fire clay."}]});
-        agents.ask(Request { id: 0, instruction: "Tighten".into(), history: vec![], selection, document: json!({}), agent: None })
-    }
-
-    #[test]
-    fn an_agent_listens_and_replies_over_the_socket() {
-        let (port, _rx, agents) = boot();
-        let id = ask(&agents);
-        let mut c = Conn::authed(port);
-        let got = c.call(&json!({"id": 1, "method": "agent.listen", "params": {"agent": "Claude", "timeoutMs": 1000}}));
-        assert_eq!((got["id"].clone(), got["result"]["id"].clone()), (json!(1), json!(id)));
-        assert_eq!(c.call(&json!({"id": 2, "method": "agent.reply", "params": {"id": id, "text": "Tightened."}}))["ok"], true);
-        assert_eq!(agents.snapshot(id).unwrap().status, Status::Answered);
-    }
-
-    #[test]
-    fn a_client_that_hangs_up_gives_its_request_back() {
-        let (port, _rx, agents) = boot();
-        let id = ask(&agents);
-        let mut c = Conn::authed(port);
-        assert_eq!(c.call(&json!({"id": 1, "method": "agent.listen", "params": {"timeoutMs": 1000}}))["result"]["id"], id);
-        drop(c);
-        let t0 = Instant::now();
-        while agents.snapshot(id).unwrap().status != Status::Queued && t0.elapsed() < Duration::from_secs(5) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(agents.snapshot(id).unwrap().status, Status::Queued, "back in the queue for the next agent");
-    }
-}
+mod tests;
 
 #[cfg(test)]
-mod limits_tests {
-    use super::*;
-    use std::net::SocketAddr;
-    use std::time::Instant;
-
-    fn small() -> Limits {
-        Limits {
-            max_clients: 2,
-            max_line: 128,
-            queue: 1,
-            idle_timeout: Duration::from_millis(300),
-            write_timeout: Duration::from_millis(300),
-            reply_timeout: Duration::from_millis(300),
-        }
-    }
-
-    fn server(limits: Limits) -> (SocketAddr, Receiver<ControlRequest>) {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap();
-        (addr, serve_on(l, TOKEN.into(), limits, egui::Context::default(), AgentHub::default()))
-    }
-
-    const TOKEN: &str = "0123456789abcdef";
-
-    fn raw(addr: SocketAddr) -> (BufReader<TcpStream>, TcpStream) {
-        let s = TcpStream::connect(addr).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        (BufReader::new(s.try_clone().unwrap()), s)
-    }
-
-    /// An authenticated connection.
-    fn client(addr: SocketAddr) -> (BufReader<TcpStream>, TcpStream) {
-        let (mut r, mut w) = raw(addr);
-        writeln!(w, "{}", json!({"id": 0, "method": "auth", "params": {"token": TOKEN}})).unwrap();
-        assert_eq!(reply(&mut r).unwrap()["ok"], true);
-        (r, w)
-    }
-
-    fn reply(r: &mut BufReader<TcpStream>) -> Option<Value> {
-        let mut s = String::new();
-        match r.read_line(&mut s) {
-            Ok(0) | Err(_) => None,
-            Ok(_) => serde_json::from_str(&s).ok(),
-        }
-    }
-
-    /// Answer every request with its method name until the server goes away.
-    fn ui(rx: Receiver<ControlRequest>) {
-        std::thread::spawn(move || {
-            for req in rx {
-                let _ = req.reply.send(json!({"ok": true, "result": req.method}));
-            }
-        });
-    }
-
-    #[test]
-    fn request_round_trip() {
-        let (addr, rx) = server(small());
-        ui(rx);
-        let (mut r, mut w) = client(addr);
-        writeln!(w, r#"{{"id":7,"method":"ui.inspect"}}"#).unwrap();
-        let v = reply(&mut r).unwrap();
-        assert_eq!(v["id"], 7);
-        assert_eq!(v["result"], "ui.inspect");
-    }
-
-    /// Every reply line until the server closes the connection.
-    fn replies_until_closed(r: &mut BufReader<TcpStream>) -> Vec<Value> {
-        std::iter::from_fn(|| reply(r)).collect()
-    }
-
-    /// A browser can POST to the port: its request line closes the connection before the JSON
-    /// line in its body is read, so nothing is dispatched.
-    #[test]
-    fn an_http_request_closes_the_connection_before_its_body_is_dispatched() {
-        let (addr, rx) = server(Limits { max_line: 512, ..small() });
-        let (mut r, mut w) = client(addr);
-        w.write_all(
-            b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: text/plain\r\n\r\n\
-              {\"id\":1,\"method\":\"engine.execute\",\"params\":{\"command\":\"slide.new\"}}\n",
-        )
-        .unwrap();
-        let replies = replies_until_closed(&mut r);
-        assert_eq!(replies.len(), 1, "{replies:?}");
-        assert!(replies[0]["error"].as_str().unwrap().contains("closing the connection"), "{replies:?}");
-        assert!(rx.try_recv().is_err(), "the body was dispatched");
-    }
-
-    #[test]
-    fn a_line_that_is_not_a_request_closes_the_connection() {
-        let (addr, rx) = server(small());
-        ui(rx);
-        for junk in [&b"hello\n"[..], b"[1,2]\n", b"{\"id\":1}\n", b"{\"method\":5}\n", b"\xff\xfe\n", b"GET /x HTTP/1.1\n"] {
-            let (mut r, mut w) = raw(addr);
-            w.write_all(junk).unwrap();
-            w.write_all(b"{\"id\":2,\"method\":\"m\"}\n").unwrap();
-            let replies = replies_until_closed(&mut r);
-            assert_eq!(replies.len(), 1, "{replies:?}");
-            assert_eq!(replies[0]["ok"], false);
-        }
-        assert!(is_http_request_line("OPTIONS * HTTP/1.1"));
-        assert!(is_http_request_line("PRI * HTTP/2.0"));
-        assert!(!is_http_request_line("{\"method\":\"GET /\"}"));
-    }
-
-    #[test]
-    fn oversized_line_closes_connection() {
-        let (addr, rx) = server(small());
-        ui(rx);
-        let (mut r, mut w) = client(addr);
-        w.write_all(&[b'x'; 300]).unwrap();
-        let v = reply(&mut r).unwrap();
-        assert!(v["error"].as_str().unwrap().contains("longer than 128"));
-        assert!(reply(&mut r).is_none());
-    }
-
-    #[test]
-    fn idle_connection_is_closed() {
-        let (addr, rx) = server(small());
-        ui(rx);
-        let (mut r, mut w) = client(addr);
-        w.write_all(b"{\"id\":1,").unwrap(); // unterminated, then silence
-        let t = Instant::now();
-        assert!(reply(&mut r).is_none());
-        assert!(t.elapsed() < Duration::from_secs(4));
-    }
-
-    #[test]
-    fn connection_limit_refuses_then_frees_slot() {
-        let (addr, rx) = server(small());
-        ui(rx);
-        let a = client(addr);
-        let (mut br, mut bw) = client(addr);
-        // Make sure both are being served before the third arrives.
-        writeln!(bw, r#"{{"id":1,"method":"m"}}"#).unwrap();
-        assert!(reply(&mut br).is_some());
-        let (mut cr, _cw) = raw(addr);
-        let v = reply(&mut cr).unwrap();
-        assert!(v["error"].as_str().unwrap().starts_with("busy"));
-        drop(a);
-        // The freed slot is reusable once the server notices the disconnect.
-        let deadline = Instant::now() + Duration::from_secs(4);
-        loop {
-            let (mut dr, mut dw) = raw(addr);
-            // A connection refused as busy is closed at once: the write may fail; try again.
-            let _ = writeln!(dw, "{}", json!({"id": 0, "method": "auth", "params": {"token": TOKEN}}));
-            if reply(&mut dr).is_some_and(|v| v["ok"] == true) {
-                let _ = writeln!(dw, r#"{{"id":2,"method":"m"}}"#);
-                if reply(&mut dr).is_some_and(|v| v["ok"] == true) {
-                    break;
-                }
-            }
-            assert!(Instant::now() < deadline, "slot never freed");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    #[test]
-    fn blocked_ui_times_out_and_full_queue_is_busy() {
-        let (addr, rx) = server(small());
-        // No UI: the first request fills the one-slot queue and times out; the second finds it full.
-        let (mut ar, mut aw) = client(addr);
-        let (mut br, mut bw) = client(addr);
-        writeln!(aw, r#"{{"id":1,"method":"m"}}"#).unwrap();
-        std::thread::sleep(Duration::from_millis(50));
-        writeln!(bw, r#"{{"id":2,"method":"m"}}"#).unwrap();
-        let b = reply(&mut br).unwrap();
-        assert!(b["error"].as_str().unwrap().starts_with("busy"));
-        assert_eq!(b["id"], 2);
-        let a = reply(&mut ar).unwrap();
-        assert_eq!(a["error"], "timeout");
-        drop(rx);
-    }
-
-    /// A request that timed out while it was still queued must not run when the window resumes (#719).
-    #[test]
-    fn timed_out_request_does_not_run_when_the_window_resumes() {
-        let (addr, rx) = server(Limits { max_line: 512, ..small() });
-        let (mut r, mut w) = client(addr);
-        writeln!(w, r#"{{"id":1,"method":"engine.execute","params":{{"command":"slide.new"}}}}"#).unwrap();
-        let t = reply(&mut r).unwrap();
-        assert_eq!(t["error"], "timeout");
-        // The window resumes and drains the queue, exactly as `SlideApp::drain_control` does.
-        let mut app = deckcraft_ui_egui::SlideApp::new(deckcraft_engine::Session::with_new(), deckcraft_ui_egui::Services::default());
-        let ctx = egui::Context::default();
-        let before = app.session.active().unwrap().doc.slides.len();
-        let req = rx.try_recv().expect("the timed-out request is still queued");
-        if req.take() {
-            let _ = deckcraft_ui_egui::control::handle(&mut app, &ctx, &req);
-        }
-        assert_eq!(app.session.active().unwrap().doc.slides.len(), before, "a request that timed out must not run when the window resumes");
-        drop(rx);
-    }
-
-    /// A request the app had already started when the reply timed out reports an unknown outcome,
-    /// not a definite failure (#719).
-    #[test]
-    fn a_request_already_started_when_the_reply_times_out_reports_an_unknown_outcome() {
-        let (addr, rx) = server(small());
-        let ui = std::thread::spawn(move || {
-            let req = rx.recv().expect("the request is queued");
-            assert!(req.take(), "the app claims the request");
-            // Still running it when the sender's wait expires.
-            std::thread::sleep(Duration::from_millis(450));
-            let _ = req.reply.send(json!({"ok": true, "result": "ran"}));
-        });
-        let (mut r, mut w) = client(addr);
-        writeln!(w, r#"{{"id":1,"method":"m"}}"#).unwrap();
-        let v = reply(&mut r).unwrap();
-        assert!(v["error"].as_str().unwrap().contains("outcome is unknown"), "{v}");
-        ui.join().unwrap();
-    }
-}
+mod auth_tests;
