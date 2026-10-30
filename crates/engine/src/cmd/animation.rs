@@ -339,7 +339,10 @@ fn options(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn clear(s: &mut Session, p: &Value) -> Result<Value> {
-    let i = usize_param(p, "index").unwrap_or(s.doc()?.selection.slide);
+    let i = match opt_usize_param(p, "index", "animation.clear")? {
+        Some(i) => i,
+        None => s.doc()?.selection.slide,
+    };
     s.edit(|doc, _| {
         if let Some(sl) = doc.slides.get_mut(i) {
             Arc::make_mut(sl).animations.clear();
@@ -433,6 +436,19 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn clear_rejects_invalid_index() {
+        let mut s = Session::with_new();
+        let r = s.execute("shape.insert", &json!({"preset": "rect", "rect": [10.0, 10.0, 100.0, 100.0]})).unwrap();
+        let id = r.get("id").unwrap().as_u64().unwrap();
+        s.execute("animation.add", &json!({"effect": "fade", "class": "entrance", "ids": [id]})).unwrap();
+        for bad_index in [json!(-1), json!(1.5)] {
+            assert!(s.execute("animation.clear", &json!({"index": bad_index})).is_err());
+            let left = s.execute("animation.get", &json!({})).unwrap();
+            assert_eq!(left.as_array().unwrap().len(), 1);
+        }
+    }
 
     #[test]
     fn animation_painter_copies_effects_between_shapes() {

@@ -10,6 +10,34 @@ fn call(s: &mut Server, id: u64, method: &str, params: Value) -> Value {
     serde_json::from_str(&out).expect("json")
 }
 
+#[test]
+fn oversized_stdio_frame_is_drained_before_the_next_request() {
+    let mut s = Server::new(Box::new(Headless::new()));
+    let mut input = vec![b'x'; 16 * 1024 * 1024 + 1];
+    input.extend_from_slice(b"\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n");
+    let mut output = Vec::new();
+    s.serve(std::io::Cursor::new(input), &mut output).unwrap();
+    let replies: Vec<Value> = std::str::from_utf8(&output).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0]["error"]["code"], -32600);
+    assert!(replies[0]["error"]["message"].as_str().unwrap().contains("16 MiB"));
+    assert_eq!(replies[1]["id"], 1);
+    assert_eq!(replies[1]["result"]["serverInfo"]["name"], "deckcraft");
+}
+
+#[test]
+fn invalid_utf8_stdio_frame_gets_a_parse_error_and_does_not_stop_serving() {
+    let mut s = Server::new(Box::new(Headless::new()));
+    let mut input = b"\xff\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n".to_vec();
+    let mut output = Vec::new();
+    s.serve(std::io::Cursor::new(&mut input), &mut output).unwrap();
+    let replies: Vec<Value> = std::str::from_utf8(&output).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0]["error"]["code"], -32700);
+    assert!(replies[0]["error"]["message"].as_str().unwrap().contains("UTF-8"));
+    assert_eq!(replies[1]["result"]["serverInfo"]["name"], "deckcraft");
+}
+
 fn tool(s: &mut Server, name: &str, args: Value) -> Value {
     let r = call(s, 9, "tools/call", json!({"name": name, "arguments": args}));
     let res = &r["result"];

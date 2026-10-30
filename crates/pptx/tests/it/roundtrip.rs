@@ -1925,3 +1925,47 @@ fn zoom_inserts_linked_slide_pictures() {
     assert!(s.execute("insert.zoom", &json!({"slides": [42]})).is_err());
     assert!(s.execute("insert.zoom", &json!({"kind": "slide"})).is_err());
 }
+
+#[test]
+fn darken_and_desaturate_write_powerpoints_hsl_shift() {
+    for (effect, preset, shift) in [("darken", 24, r#"s="0" l="-25098""#), ("desaturate", 25, r#"s="-70588" l="0""#)] {
+        let mut p = defaults::new_presentation(None);
+        let mut s = p.slides[0].as_ref().clone();
+        let sh = shape(&mut p, "Target", 100.0, 100.0, 100.0, 100.0);
+        let id = sh.id;
+        s.shapes.push(sh);
+        s.animations.push(Animation { shape: id, class: AnimClass::Emphasis, effect: effect.into(), duration_ms: 500, ..Default::default() });
+        p.slides[0] = Arc::new(s);
+        let bytes = deckcraft_pptx::export(&p).expect("export");
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("ppt/slides/slide1.xml").unwrap(), &mut xml).unwrap();
+        assert!(xml.contains(&format!(r#"presetID="{preset}""#)), "{effect}");
+        assert!(xml.contains(r#"clrSpc="hsl""#) && xml.contains(shift), "{effect}: {xml}");
+        assert_eq!(round(&p).slides[0].animations[0].effect, effect);
+    }
+}
+
+/// PowerPoint's default durations (COM `AddEffect`), which differ from the 0.5 s most effects get.
+#[test]
+fn default_durations_match_powerpoint() {
+    for (effect, ms) in [
+        ("grow", 1000),
+        ("shrinkTurn", 1000),
+        ("box", 2000),
+        ("circle", 2000),
+        ("diamond", 2000),
+        ("boxOut", 2000),
+        ("diamondOut", 2000),
+        ("expand", 1000),
+        ("contract", 1000),
+        ("spinner", 500),
+        ("spinnerOut", 500),
+        ("colorPulse", 250),
+        ("objectColor", 500),
+        ("boldFlash", 2000),
+    ] {
+        let a = deckcraft_model::anim::ANIMATIONS.iter().find(|a| a.0 == effect).unwrap();
+        assert_eq!(a.4, ms, "{effect}");
+    }
+}
