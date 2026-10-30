@@ -631,18 +631,14 @@ pub fn paragraph(imp: &mut Imp, part: &Part, p: &El) -> Paragraph {
                 let text: String = e.child("t").map(|t| t.text()).unwrap_or_default();
                 push_text_runs(&mut para, props, &text);
             }
-            "br" => {
-                if para.runs.len() < MAX_PARAGRAPH_RUNS {
-                    let props = run_props(imp, part, e);
-                    para.runs.push(Run { text: String::new(), props, kind: RunKind::Break });
-                }
+            "br" if para.runs.len() < MAX_PARAGRAPH_RUNS => {
+                let props = run_props(imp, part, e);
+                para.runs.push(Run { text: String::new(), props, kind: RunKind::Break });
             }
-            "fld" => {
-                if para.runs.len() < MAX_PARAGRAPH_RUNS {
-                    let props = run_props(imp, part, e);
-                    let text = e.child("t").map(|t| t.text()).unwrap_or_default();
-                    para.runs.push(Run { text, props, kind: RunKind::Field { field: e.attr("type").unwrap_or("").to_string() } });
-                }
+            "fld" if para.runs.len() < MAX_PARAGRAPH_RUNS => {
+                let props = run_props(imp, part, e);
+                let text = e.child("t").map(|t| t.text()).unwrap_or_default();
+                para.runs.push(Run { text, props, kind: RunKind::Field { field: e.attr("type").unwrap_or("").to_string() } });
             }
             "m" => push_math_run(&mut para, part, e),
             "endParaRPr" => para.end_props = rpr(imp, part, e),

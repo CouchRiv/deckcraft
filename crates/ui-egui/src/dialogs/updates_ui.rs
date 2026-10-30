@@ -16,7 +16,7 @@ pub(crate) struct Runtime {
 
 impl Default for Runtime {
     fn default() -> Self {
-        Self { updater: Updater::new(&craft_update::suite::DECKCRAFT, VERSION), enabled: false, check_requested: false }
+        Self { updater: Updater::new(&crate::UPDATE_APP, VERSION), enabled: false, check_requested: false }
     }
 }
 
